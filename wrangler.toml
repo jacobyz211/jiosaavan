@@ -6,6 +6,9 @@ compatibility_flags = ["global_fetch_strictly_public"]
 # Bump this if you rename the deployed Worker
 # workers_dev = true
 
+[placement]
+mode = "smart"
+
 [observability]
 enabled = true
 
