@@ -1,17 +1,26 @@
 /**
  * Eclipse Music addon — JioSaavn
- * Wraps the  unofficial JioSaavn API (saavn.dev) and exposes it
- * through the Eclipse addon contract: /manifest.json, /search, /stream/:id,
- * /album/:id, /artist/:id, /playlist/:id
+ * Wraps your self-hosted jiosaavn-api (or public saavn.dev as fallback) and
+ * exposes it through the Eclipse addon contract: /manifest.json, /search,
+ * /stream/:id, /album/:id, /artist/:id, /playlist/:id
  *
- * Also serves a small landing page at "/" (styled after monochrome /
- * th a "Generate Addon URL" button that mints a
- * fresh token every press via POST /generate.
+ * Also serves a landing page at "/" (monochrome theme) with a
+ * "Generate Addon URL" button that mints a fresh token every press.
+ *
+ * Caching: Upstash Redis (REST, edge-compatible) with an in-memory Map
+ * fallback when UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN aren't
+ * configured — same pattern as qobuz-tidal-eclipse.
  *
  * Deploy: wrangler deploy
+ * Secrets: wrangler secret put UPSTASH_REDIS_REST_URL
+ *          wrangler secret put UPSTASH_REDIS_REST_TOKEN
  */
 
-const SAAVN_BASE = "https://jiosaavn-api.cyrusna29.workers.dev";
+import { Redis } from "@upstash/redis/cloudflare";
+
+// Point this at your self-hosted jiosaavn-api Worker's URL + "/api"
+const SAAVN_BASE = "https://jiosaavn-api.cyrusna29.workers.dev/api";
+
 const CACHE_TTL_SEARCH = 60 * 10;      // 10 min
 const CACHE_TTL_DETAIL = 60 * 60;      // 1 hour
 const CACHE_TTL_STREAM = 60 * 15;      // 15 min (download URLs expire)
@@ -111,31 +120,65 @@ async function saavnGet(path) {
   const res = await fetch(`${SAAVN_BASE}${path}`, {
     headers: { "User-Agent": "Mozilla/5.0 (EclipseAddon/1.0)" },
   });
-  if (!res.ok) throw new Error(`saavn.dev ${path} -> ${res.status}`);
+  if (!res.ok) throw new Error(`jiosaavn-api ${path} -> ${res.status}`);
   const body = await res.json();
-  if (!body.success) throw new Error(`saavn.dev ${path} returned success:false`);
+  if (!body.success) throw new Error(`jiosaavn-api ${path} returned success:false`);
   return body.data;
 }
 
-async function withCache(request, ttl, fn) {
-  const cache = caches.default;
-  const cacheKey = new Request(request.url, request);
-  let response = await cache.match(cacheKey);
-  if (response) return response;
+/* ------------------------------------------------------------------ */
+/* Upstash Redis + in-memory fallback — same pattern as               */
+/* qobuz-tidal-eclipse: getRedis(env) / rGet / rSet                    */
+/* ------------------------------------------------------------------ */
+
+const memCache = new Map();
+
+function getRedis(env) {
+  if (env?.UPSTASH_REDIS_REST_URL && env?.UPSTASH_REDIS_REST_TOKEN) return Redis.fromEnv(env);
+  return null;
+}
+
+async function rGet(redis, key) {
+  if (redis) {
+    try {
+      return await redis.get(key);
+    } catch {}
+  }
+  const e = memCache.get(key);
+  if (!e) return null;
+  if (e.exp < Date.now()) {
+    memCache.delete(key);
+    return null;
+  }
+  return e.val;
+}
+
+async function rSet(redis, key, value, ttl) {
+  if (redis) {
+    try {
+      await redis.set(key, value, { ex: ttl });
+      return;
+    } catch {}
+  }
+  memCache.set(key, { val: value, exp: Date.now() + ttl * 1000 });
+  if (memCache.size > 500) memCache.delete(memCache.keys().next().value);
+}
+
+async function withRedisCache(env, key, ttl, fn) {
+  const redis = getRedis(env);
+  const cached = await rGet(redis, key);
+  if (cached) return json(cached);
 
   const data = await fn();
-  response = json(data);
-  const cached = response.clone();
-  cached.headers.append("Cache-Control", `public, max-age=${ttl}`);
-  await cache.put(cacheKey, cached);
-  return response;
+  await rSet(redis, key, data, ttl);
+  return json(data);
 }
 
 function manifest(token) {
   return {
     id: token ? `com.eclipse-addons.jiosaavn.${token}` : "com.eclipse-addons.jiosaavn",
     name: "JioSaavn",
-    version: "1.0.0",
+    version: "1.1.0",
     description: "Stream Bollywood, Indian regional, and international tracks from JioSaavn.",
     icon: "https://www.jiosaavn.com/favicon.ico",
     resources: ["search", "stream", "catalog"],
@@ -219,8 +262,7 @@ async function handlePlaylist(id) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Token generation — same shape as qobuz-tidal-eclipse's             */
-/* generateToken(): 28 random bytes, lowercase base36 alphabet        */
+/* Token generation — 28 random bytes, lowercase base36 alphabet       */
 /* ------------------------------------------------------------------ */
 
 function generateToken() {
@@ -235,9 +277,7 @@ function generateToken() {
 }
 
 /* ------------------------------------------------------------------ */
-/* Landing page — monochrome dark theme (background:#080808,          */
-/* card:#111 / border:#1e1e1e / radius:18px), matching the reference   */
-/* repos. Generate button hits POST /generate for a fresh token.       */
+/* Landing page — monochrome dark theme                                */
 /* ------------------------------------------------------------------ */
 
 function landingPage() {
@@ -322,7 +362,7 @@ function landingPage() {
 }
 
 export default {
-  async fetch(request) {
+  async fetch(request, env) {
     if (request.method === "OPTIONS") {
       return new Response(null, { headers: CORS_HEADERS });
     }
@@ -350,27 +390,32 @@ export default {
 
       if (path === "/search") {
         const q = url.searchParams.get("q") || "";
-        return withCache(request, CACHE_TTL_SEARCH, () => handleSearch(q));
+        const cacheKey = `jiosaavn:search:${q.toLowerCase()}`;
+        return withRedisCache(env, cacheKey, CACHE_TTL_SEARCH, () => handleSearch(q));
       }
 
       const streamMatch = path.match(/^\/stream\/(.+)$/);
       if (streamMatch) {
-        return withCache(request, CACHE_TTL_STREAM, () => handleStream(streamMatch[1]));
+        const cacheKey = `jiosaavn:stream:${streamMatch[1]}`;
+        return withRedisCache(env, cacheKey, CACHE_TTL_STREAM, () => handleStream(streamMatch[1]));
       }
 
       const albumMatch = path.match(/^\/album\/(.+)$/);
       if (albumMatch) {
-        return withCache(request, CACHE_TTL_DETAIL, () => handleAlbum(albumMatch[1]));
+        const cacheKey = `jiosaavn:album:${albumMatch[1]}`;
+        return withRedisCache(env, cacheKey, CACHE_TTL_DETAIL, () => handleAlbum(albumMatch[1]));
       }
 
       const artistMatch = path.match(/^\/artist\/(.+)$/);
       if (artistMatch) {
-        return withCache(request, CACHE_TTL_DETAIL, () => handleArtist(artistMatch[1]));
+        const cacheKey = `jiosaavn:artist:${artistMatch[1]}`;
+        return withRedisCache(env, cacheKey, CACHE_TTL_DETAIL, () => handleArtist(artistMatch[1]));
       }
 
       const playlistMatch = path.match(/^\/playlist\/(.+)$/);
       if (playlistMatch) {
-        return withCache(request, CACHE_TTL_DETAIL, () => handlePlaylist(playlistMatch[1]));
+        const cacheKey = `jiosaavn:playlist:${playlistMatch[1]}`;
+        return withRedisCache(env, cacheKey, CACHE_TTL_DETAIL, () => handlePlaylist(playlistMatch[1]));
       }
 
       return json({ error: "Not found" }, 404);
