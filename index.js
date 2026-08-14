@@ -3,32 +3,19 @@
  * Wraps your self-hosted jiosaavn-api (https://jiosaavn-api.cyrusna29.workers.dev)
  * and exposes it through the Eclipse addon contract.
  *
- * CACHING POLICY (changed per feedback):
+ * CACHING POLICY:
  * - /search and /stream/:id are ALWAYS fetched fresh, no Redis, no
- *   in-memory cache. Search results are user/query-specific and highly
- *   volatile at scale; stream URLs can carry short-lived expiry, so a
- *   cached URL served to a different user later can simply be dead —
- *   worse as user count grows, not just slower. Neither should ever be
- *   served stale.
- * - /album, /artist, /playlist keep Redis caching — that content is
- *   genuinely static (an album's tracklist doesn't change minute to
- *   minute) and caching it doesn't carry the correctness risk above.
+ *   in-memory cache.
+ * - /album, /artist, /playlist keep Redis caching.
  *
- * SPEED WORK (this version):
- * 1. Hard per-call timeout via AbortController (3s) so one slow
- *    upstream call can't stall a whole request.
- * 2. Trimmed search payload sizes.
- * 3. Artist fallback calls run in parallel, not sequentially.
- * 4. Recommend enabling Smart Placement in wrangler.toml — this is an
- *    infrastructure-level fix, not caching: it moves this Worker's
- *    execution closer to jiosaavn-api's origin instead of closer to the
- *    end user, cutting the network round-trip time on every single
- *    request (cached or not). Add to wrangler.toml:
- *      [placement]
- *      mode = "smart"
- * 5. Single retry-with-shorter-timeout on stream lookups only (the one
- *    call where a second attempt is worth the extra latency, since a
- *    failed stream call means the user can't play the track at all).
+ * REGION HEADERS (new):
+ * Every outbound call to jiosaavn-api now carries spoofed India geo
+ * headers (X-Forwarded-For / Client-IP set to an Indian IP range, plus
+ * a JioSaavn language cookie covering English + regional languages).
+ * If your jiosaavn-api backend forwards/respects these on its own
+ * request to JioSaavn's real servers, this unlocks India-licensed
+ * catalog (mainstream Western tracks included) the same way a VPN set
+ * to India would. No architecture changes otherwise.
  *
  * Deploy: wrangler deploy
  * wrangler.toml: compatibility_flags = ["global_fetch_strictly_public"]
@@ -41,9 +28,23 @@ const SAAVN_BASE = "https://jiosaavn-api.cyrusna29.workers.dev/api";
 
 const CACHE_TTL_DETAIL = 60 * 60; // album/artist/playlist only — 1 hour
 
-const FETCH_TIMEOUT_MS = 3000;        // general hard cap per backend call
-const STREAM_TIMEOUT_MS = 2500;       // first attempt
-const STREAM_RETRY_TIMEOUT_MS = 2000; // second attempt, shorter
+const FETCH_TIMEOUT_MS = 3000;
+const STREAM_TIMEOUT_MS = 2500;
+const STREAM_RETRY_TIMEOUT_MS = 2000;
+
+// Spoofed India geo headers — sent on every outbound call.
+const INDIA_IP = "49.36.0.1";
+const INDIA_LANGUAGE_COOKIE =
+  "L=english%2Chindi%2Cpunjabi%2Ctamil%2Ctelugu%2Cmarathi%2Cgujarati%2Cbengali%2Ckannada%2Cmalayalam%2Cbhojpuri%2Crajasthani%2Curdu%2Charyanvi; gdpr_acceptance=true;";
+
+function regionHeaders() {
+  return {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "X-Forwarded-For": INDIA_IP,
+    "Client-IP": INDIA_IP,
+    "Cookie": INDIA_LANGUAGE_COOKIE,
+  };
+}
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -140,7 +141,7 @@ function mapPlaylist(playlist) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Backend fetch with a hard timeout                                   */
+/* Backend fetch — hard timeout + spoofed India region headers         */
 /* ------------------------------------------------------------------ */
 
 async function saavnGet(path, timeoutMs = FETCH_TIMEOUT_MS) {
@@ -148,7 +149,7 @@ async function saavnGet(path, timeoutMs = FETCH_TIMEOUT_MS) {
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const res = await fetch(`${SAAVN_BASE}${path}`, {
-      headers: { "User-Agent": "Mozilla/5.0 (EclipseAddon/1.0)" },
+      headers: regionHeaders(),
       signal: controller.signal,
     });
     if (!res.ok) {
@@ -221,7 +222,7 @@ function manifest(token) {
   return {
     id: token ? `com.eclipse-addons.jiosaavn.${token}` : "com.eclipse-addons.jiosaavn",
     name: "JioSaavn",
-    version: "1.5.0",
+    version: "1.6.0",
     description: "Stream Bollywood, Indian regional, and international tracks from JioSaavn.",
     icon: "https://www.jiosaavn.com/favicon.ico",
     resources: ["search", "stream", "catalog"],
@@ -272,8 +273,6 @@ async function handleStream(id) {
   try {
     return await resolveStream(id, STREAM_TIMEOUT_MS);
   } catch (firstErr) {
-    // One quick retry — worth the extra latency here specifically,
-    // since a failed stream call means playback can't start at all.
     try {
       return await resolveStream(id, STREAM_RETRY_TIMEOUT_MS);
     } catch {
@@ -501,19 +500,16 @@ export default {
         return json(manifest(token));
       }
 
-      // Always fresh — no caching.
       if (rest === "/search" || rest.startsWith("/search?")) {
         const q = url.searchParams.get("q") || "";
         return json(await handleSearch(q));
       }
 
-      // Always fresh — no caching.
       const streamMatch = rest.match(/^\/stream\/(.+)$/);
       if (streamMatch) {
         return json(await handleStream(streamMatch[1]));
       }
 
-      // Cached — static content.
       const albumMatch = rest.match(/^\/album\/(.+)$/);
       if (albumMatch) {
         const cacheKey = `jiosaavn:album:${albumMatch[1]}`;
