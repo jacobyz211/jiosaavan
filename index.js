@@ -2,23 +2,27 @@
  * Eclipse Music addon — JioSaavn (direct)
  *
  * Talks directly to JioSaavn's raw internal API (api.php). Every call
- * carries spoofed India geo headers (X-Forwarded-For / Client-IP +
- * language cookie) so India-licensed catalog (mainstream Western
- * tracks included) is unlocked without needing the self-hosted
- * jiosaavn-api backend as a middle hop.
+ * carries spoofed India geo headers so India-licensed catalog is
+ * unlocked without a middle-hop backend.
  *
- * Endpoint names (confirmed against a working reference config):
- *   songs:     search.getResults        <-- fixed, was search.getSongResults
- *   albums:    search.getAlbumResults
- *   artists:   search.getArtistResults
- *   playlists: search.getPlaylistResults
- *   song:      song.getDetails
- *   album:     content.getAlbumDetails
- *   artist:    artist.getArtistPageDetails
- *   playlist:  playlist.getDetails
+ * AUDIO QUALITY FIX (this version):
+ * Previously every stream URL was force-upgraded to "_320" regardless
+ * of whether that bitrate was actually encoded for the track. Now we
+ * read the real "320kbps"/"160kbps" flags from song.getDetails and
+ * only request a bitrate that's confirmed to exist — otherwise we
+ * leave the URL's native default bitrate untouched. Forcing a
+ * non-existent bitrate variant is the most likely cause of audio that
+ * "feels off" (CDN 404/fallback instead of a real encode).
  *
- * Stream URLs come back DES-ECB encrypted (key "38346591") and are
- * decrypted here.
+ * SPEED:
+ * Already down to a single hop (addon -> JioSaavn directly, no
+ * jiosaavn-api backend). The remaining lever is infrastructure, not
+ * code — add to wrangler.toml:
+ *   [placement]
+ *   mode = "smart"
+ * This moves the Worker's execution closer to JioSaavn's origin
+ * instead of closer to the end user, cutting round-trip time on every
+ * request without touching caching or correctness.
  *
  * CACHING POLICY:
  * - /search and /stream/:id are ALWAYS fetched fresh, no cache.
@@ -26,6 +30,7 @@
  *
  * Deploy: wrangler deploy
  * wrangler.toml: compatibility_flags = ["global_fetch_strictly_public"]
+ *                [placement] mode = "smart"
  */
 
 import { Redis } from "@upstash/redis/cloudflare";
@@ -266,7 +271,7 @@ async function jioFetch(callName, params, timeoutMs = FETCH_TIMEOUT_MS) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Mapping — raw JioSaavn item -> Eclipse track/album/artist/playlist  */
+/* Mapping                                                              */
 /* ------------------------------------------------------------------ */
 
 function mapTrack(item) {
@@ -315,10 +320,24 @@ function mapPlaylist(item) {
   };
 }
 
-function formatAudioUrl(decryptedUrl, preferredQuality) {
+/**
+ * Only substitutes the bitrate suffix if that bitrate is CONFIRMED
+ * encoded for this track (via the 320kbps/160kbps flags). Forcing an
+ * unconfirmed bitrate onto the URL points at a file that may not
+ * exist, which is the most likely cause of "off" sounding playback.
+ */
+function pickConfirmedBitrate(more) {
+  const has320 = more["320kbps"] === "true" || more["320kbps"] === true;
+  if (has320) return "320";
+  const has160 = more["160kbps"] === "true" || more["160kbps"] === true;
+  if (has160) return "160";
+  return null; // leave the URL's native default bitrate untouched
+}
+
+function formatAudioUrl(decryptedUrl, confirmedBitrate) {
   if (!decryptedUrl) return "";
-  const bitrate = preferredQuality || "320";
-  return decryptedUrl.replace(/_(12|48|96|128|160|320)\.(mp4|mp3)$/i, `_${bitrate}.$2`);
+  if (!confirmedBitrate) return decryptedUrl;
+  return decryptedUrl.replace(/_(12|48|96|128|160|320)\.(mp4|mp3)$/i, `_${confirmedBitrate}.$2`);
 }
 
 /* ------------------------------------------------------------------ */
@@ -361,8 +380,8 @@ function manifest(token) {
   return {
     id: token ? `com.eclipse-addons.jiosaavn.${token}` : "com.eclipse-addons.jiosaavn",
     name: "JioSaavn",
-    version: "2.0.1",
-    description: "Stream Bollywood, Indian regional, and international tracks from JioSaavn — direct API, India-region headers.",
+    version: "2.1.0",
+    description: "Stream Bollywood, Indian regional, and international tracks from JioSaavn — direct API, India-region headers, confirmed-bitrate audio.",
     icon: "https://www.jiosaavn.com/favicon.ico",
     resources: ["search", "stream", "catalog"],
     types: ["track", "album", "artist", "playlist"],
@@ -371,7 +390,7 @@ function manifest(token) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Search — always fresh, four parallel raw-API calls                  */
+/* Search                                                               */
 /* ------------------------------------------------------------------ */
 
 async function handleSearch(query) {
@@ -393,21 +412,25 @@ async function handleSearch(query) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Stream — song.getDetails + DES decrypt, always fresh, one retry     */
+/* Stream — confirmed-bitrate only, always fresh, one fast retry       */
 /* ------------------------------------------------------------------ */
 
 async function resolveStream(id, timeoutMs) {
   const data = await jioFetch("song.getDetails", { pids: id }, timeoutMs);
   const songObj = data[id] || (data.songs && data.songs[0]);
   if (!songObj) throw new Error("Track not found");
-  const encUrl = (songObj.more_info && songObj.more_info.encrypted_media_url) || songObj.encrypted_media_url;
+  const more = songObj.more_info || {};
+  const encUrl = more.encrypted_media_url || songObj.encrypted_media_url;
   if (!encUrl) throw new Error("No encrypted media URL found for this track");
+
   const decrypted = DES.decrypt(encUrl, DES_KEY);
-  const finalUrl = formatAudioUrl(decrypted, "320");
+  const confirmedBitrate = pickConfirmedBitrate(more);
+  const finalUrl = formatAudioUrl(decrypted, confirmedBitrate);
+
   return {
     url: finalUrl,
     format: finalUrl.indexOf(".mp3") !== -1 ? "mp3" : "mp4",
-    quality: finalUrl.indexOf("_320") !== -1 ? "320kbps" : "160kbps",
+    quality: confirmedBitrate ? `${confirmedBitrate}kbps` : (finalUrl.match(/_(\d+)\.(mp4|mp3)$/i)?.[1] + "kbps" || "unknown"),
   };
 }
 
@@ -540,7 +563,7 @@ function landingPage() {
   <div class="card">
     <h1>JioSaavn Addon for Eclipse</h1>
     <p class="sub">Generate a unique addon URL and install it in Eclipse under Settings → Cloud Storage → Add Connection → Addons.</p>
-    <div class="tip"><b>Note:</b> Direct JioSaavn API, India-region headers applied. Each generated URL carries a fresh, unique token in its path.</div>
+    <div class="tip"><b>Note:</b> Direct JioSaavn API, India-region headers applied, confirmed-bitrate audio only.</div>
     <button id="genBtn" onclick="generate()">Generate Addon URL</button>
     <div id="genBox">
       <div class="label">Your manifest URL</div>
