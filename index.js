@@ -1,15 +1,25 @@
 /**
  * Eclipse Music addon — JioSaavn
- * Wraps your - -api (or public saavn.dev as fallback) and
- * exposes it  the Eclipse addon contract: /manifest.json, /search,
- * /stream/:id, /album/:id, /artist/:id, /playlist/:id
+ * Wraps your self-hosted jiosaavn-api and exposes it through the Eclipse
+ * addon contract: /manifest.json, /search, /stream/:id, /album/:id,
+ * /artist/:id, /playlist/:id — with an OPTIONAL leading /{token}/ path
+ * segment, e.g. /abc123/manifest.json, /abc123/search?q=...
+ *
+ * IMPORTANT FIX: the token now lives in the URL PATH, not a query string.
+ * Eclipse builds follow-up requests (search, stream, etc.) by stripping
+ * "manifest.json" off the end of your installed manifest URL and
+ * appending the new path segment. If the token were a query param
+ * (?token=xyz), that string-append logic corrupts the URL — which is
+ * exactly what was happening (`/manifest.json?token=xyz/search?q=...`).
+ * With the token as a path segment, Eclipse's append logic produces a
+ * clean `/xyz/search?q=...`, which this Worker parses correctly below.
  *
  * Also serves a landing page at "/" (monochrome theme) with a
  * "Generate Addon URL" button that mints a fresh token every press.
  *
  * Caching: Upstash Redis (REST, edge-compatible) with an in-memory Map
  * fallback when UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN aren't
- * configured — same pattern as qobuz-tidal-eclipse.
+ * configured.
  *
  * Deploy: wrangler deploy
  * Secrets: wrangler secret put UPSTASH_REDIS_REST_URL
@@ -19,7 +29,7 @@
 import { Redis } from "@upstash/redis/cloudflare";
 
 // Point this at your self-hosted jiosaavn-api Worker's URL + "/api"
-const SAAVN_BASE = "https://jiosaavn-api.cyrusna29.workers.dev/api";
+const SAAVN_BASE = "https://YOUR-JIOSAAVN-API.workers.dev/api";
 
 const CACHE_TTL_SEARCH = 60 * 10;      // 10 min
 const CACHE_TTL_DETAIL = 60 * 60;      // 1 hour
@@ -30,6 +40,9 @@ const CORS_HEADERS = {
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type",
 };
+
+// Route names recognized at the root of the path (no token prefix)
+const KNOWN_ROUTES = new Set(["manifest.json", "search", "stream", "album", "artist", "playlist", "generate"]);
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -127,8 +140,7 @@ async function saavnGet(path) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Upstash Redis + in-memory fallback — same pattern as               */
-/* qobuz-tidal-eclipse: getRedis(env) / rGet / rSet                    */
+/* Upstash Redis + in-memory fallback                                  */
 /* ------------------------------------------------------------------ */
 
 const memCache = new Map();
@@ -178,7 +190,7 @@ function manifest(token) {
   return {
     id: token ? `com.eclipse-addons.jiosaavn.${token}` : "com.eclipse-addons.jiosaavn",
     name: "JioSaavn",
-    version: "1.1.0",
+    version: "1.2.0",
     description: "Stream Bollywood, Indian regional, and international tracks from JioSaavn.",
     icon: "https://www.jiosaavn.com/favicon.ico",
     resources: ["search", "stream", "catalog"],
@@ -277,6 +289,20 @@ function generateToken() {
 }
 
 /* ------------------------------------------------------------------ */
+/* Path parsing — strip an optional leading /{token}/ segment          */
+/* ------------------------------------------------------------------ */
+
+function parsePath(pathname) {
+  const parts = pathname.split("/").filter(Boolean);
+  if (parts.length === 0) return { token: null, rest: "/" };
+  if (KNOWN_ROUTES.has(parts[0])) {
+    return { token: null, rest: "/" + parts.join("/") };
+  }
+  // first segment isn't a known route name -> treat it as the token
+  return { token: parts[0], rest: "/" + parts.slice(1).join("/") };
+}
+
+/* ------------------------------------------------------------------ */
 /* Landing page — monochrome dark theme                                */
 /* ------------------------------------------------------------------ */
 
@@ -310,7 +336,7 @@ function landingPage() {
   <div class="card">
     <h1>JioSaavn Addon for Eclipse</h1>
     <p class="sub">Generate a unique addon URL and install it in Eclipse under Settings → Cloud Storage → Add Connection → Addons.</p>
-    <div class="tip"><b>Note:</b> JioSaavn requires no login or API key. Each generated URL carries a fresh, unique token — it's a per-install identifier, not a credential.</div>
+    <div class="tip"><b>Note:</b> JioSaavn requires no login or API key. Each generated URL carries a fresh, unique token in its path — it's a per-install identifier, not a credential.</div>
     <button id="genBtn" onclick="generate()">Generate Addon URL</button>
     <div id="genBox">
       <div class="label">Your manifest URL</div>
@@ -368,57 +394,56 @@ export default {
     }
 
     const url = new URL(request.url);
-    const path = url.pathname;
+    const { token, rest } = parsePath(url.pathname);
 
     try {
-      if (path === "/") {
+      if (rest === "/" || rest === "") {
         return new Response(landingPage(), {
           headers: { "Content-Type": "text/html; charset=utf-8", ...CORS_HEADERS },
         });
       }
 
-      if (path === "/generate" && request.method === "POST") {
-        const token = generateToken();
-        const manifestUrl = `${url.origin}/manifest.json?token=${token}`;
-        return json({ token, manifestUrl });
+      if (rest === "/generate" && request.method === "POST") {
+        const newToken = generateToken();
+        const manifestUrl = `${url.origin}/${newToken}/manifest.json`;
+        return json({ token: newToken, manifestUrl });
       }
 
-      if (path === "/manifest.json") {
-        const token = url.searchParams.get("token");
+      if (rest === "/manifest.json") {
         return json(manifest(token));
       }
 
-      if (path === "/search") {
+      if (rest === "/search" || rest.startsWith("/search?")) {
         const q = url.searchParams.get("q") || "";
         const cacheKey = `jiosaavn:search:${q.toLowerCase()}`;
         return withRedisCache(env, cacheKey, CACHE_TTL_SEARCH, () => handleSearch(q));
       }
 
-      const streamMatch = path.match(/^\/stream\/(.+)$/);
+      const streamMatch = rest.match(/^\/stream\/(.+)$/);
       if (streamMatch) {
         const cacheKey = `jiosaavn:stream:${streamMatch[1]}`;
         return withRedisCache(env, cacheKey, CACHE_TTL_STREAM, () => handleStream(streamMatch[1]));
       }
 
-      const albumMatch = path.match(/^\/album\/(.+)$/);
+      const albumMatch = rest.match(/^\/album\/(.+)$/);
       if (albumMatch) {
         const cacheKey = `jiosaavn:album:${albumMatch[1]}`;
         return withRedisCache(env, cacheKey, CACHE_TTL_DETAIL, () => handleAlbum(albumMatch[1]));
       }
 
-      const artistMatch = path.match(/^\/artist\/(.+)$/);
+      const artistMatch = rest.match(/^\/artist\/(.+)$/);
       if (artistMatch) {
         const cacheKey = `jiosaavn:artist:${artistMatch[1]}`;
         return withRedisCache(env, cacheKey, CACHE_TTL_DETAIL, () => handleArtist(artistMatch[1]));
       }
 
-      const playlistMatch = path.match(/^\/playlist\/(.+)$/);
+      const playlistMatch = rest.match(/^\/playlist\/(.+)$/);
       if (playlistMatch) {
         const cacheKey = `jiosaavn:playlist:${playlistMatch[1]}`;
         return withRedisCache(env, cacheKey, CACHE_TTL_DETAIL, () => handlePlaylist(playlistMatch[1]));
       }
 
-      return json({ error: "Not found" }, 404);
+      return json({ error: "Not found", path: rest }, 404);
     } catch (err) {
       return json({ error: err.message || "Internal error" }, 500);
     }
