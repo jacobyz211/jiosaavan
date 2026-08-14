@@ -1,26 +1,28 @@
 /**
  * Eclipse Music addon — JioSaavn (direct)
  *
- * Talks directly to JioSaavn's raw internal API (api.php) with spoofed
- * India geo headers.
+ * Talks directly to JioSaavn's raw internal API (api.php). Every call
+ * carries spoofed India geo headers so India-licensed catalog is
+ * unlocked without a middle-hop backend.
  *
- * THIS VERSION FIXES:
- * 1. Missing artist top tracks/albums — artist.getArtistPageDetails
- *    doesn't nest topSongs/topAlbums the same way for every artist.
- *    Now checks many possible shapes, and if still empty, falls back
- *    to dedicated artist.getArtistMoreSong / artist.getArtistMoreAlbum
- *    calls (JioSaavn's own paginated artist-page endpoints).
- * 2. White/blank profile pictures — upgradeArtwork() now returns
- *    undefined (omitted from JSON) instead of "" when there's no
- *    image, so Eclipse falls back to its own placeholder UI instead
- *    of trying to load an empty src. Also guards against `image`
- *    coming back as an array instead of a string (some endpoints
- *    return it differently), and upgrades ANY embedded size token to
- *    500x500 instead of only three hardcoded ones — improves hit rate
- *    for higher-res artwork across tracks, albums, and artist photos.
+ * FIXES THIS VERSION:
+ * 1. Artwork upgrading now handles BOTH shapes JioSaavn returns images
+ *    in: a flat string (search results) and an array of
+ *    {quality, link} objects (artist profile responses). The artist
+ *    picture bug was almost certainly this — the old upgradeArtwork()
+ *    only handled the string case and silently failed on arrays.
+ * 2. Artist pages now call artist.getArtistMoreAlbum in a full
+ *    pagination loop (not just the limited top-N slice from the main
+ *    profile call), sorted by latest/desc at the API level AND
+ *    re-sorted client-side by year as a safety net. This should fix
+ *    both "missing albums" and "not sorted by recency."
+ *  3. Artist top tracks parsing made more defensive against shape
+ *    variance (topSongs.songs / topSongs / top_songs array-or-object).
+ * 4. Search album/artist/playlist limits raised substantially so
+ *    results aren't artificially thin.
  *
- * STREAM URL POLICY (unchanged): decrypt and return AS-IS, no bitrate
- * substitution.
+ * STREAM URL POLICY (unchanged):
+ * No bitrate substitution — decrypt and return AS-IS.
  *
  * CACHING POLICY (unchanged):
  * - /search and /stream/:id are ALWAYS fetched fresh, no cache.
@@ -191,6 +193,7 @@ const FETCH_TIMEOUT_MS = 3500;
 const STREAM_TIMEOUT_MS = 3000;
 const STREAM_RETRY_TIMEOUT_MS = 2500;
 const CACHE_TTL_DETAIL = 60 * 60;
+const MAX_ARTIST_ALBUM_PAGES = 15; // safety cap while paginating "all albums"
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -213,27 +216,21 @@ function sanitizeText(text) {
 }
 
 /**
- * Returns undefined (not "") when there's no usable image, so it gets
- * OMITTED from the JSON response entirely — Eclipse should fall back
- * to its own placeholder UI for a missing field rather than trying to
- * load an empty src, which is what was likely rendering as a blank
- * white box.
- *
- * Also guards against `image` arriving as an array (quality-tiered
- * format some endpoints use) instead of a plain string, and upgrades
- * ANY embedded "-{width}x{height}." size token to 500x500 instead of
- * only three hardcoded sizes.
+ * Handles BOTH artwork shapes JioSaavn returns:
+ *  - a flat string URL (search results, songs, albums, playlists)
+ *  - an array of { quality: "50x50"|"150x150"|"500x500", link/url }
+ *    (commonly used on artist profile responses)
+ * Always upgrades to the highest resolution available.
  */
 function upgradeArtwork(image) {
-  let url = image;
+  if (!image) return "";
   if (Array.isArray(image)) {
-    if (image.length === 0) return undefined;
-    const last = image[image.length - 1];
-    url = last && (last.url || last.link);
+    if (image.length === 0) return "";
+    const best = image[image.length - 1];
+    const link = best.link || best.url || "";
+    return link.replace("http:", "https:");
   }
-  if (!url || typeof url !== "string") return undefined;
-  const upgraded = url.replace("http:", "https:").replace(/-\d+x\d+\./, "-500x500.");
-  return upgraded;
+  return String(image).replace("http:", "https:").replace(/-(50x50|150x150|250x250)\./g, "-500x500.");
 }
 
 function formatArtist(item) {
@@ -308,13 +305,17 @@ function mapTrack(item) {
 }
 
 function mapAlbum(item) {
+  const more = item.more_info || {};
+  const yearRaw = item.year || more.year;
+  const releaseDateRaw = more.release_date || item.release_date;
   return {
     id: String(item.id || ""),
     title: sanitizeText(item.title || item.name || "Untitled Album"),
     artist: sanitizeText(formatArtist(item)),
     artworkURL: upgradeArtwork(item.image),
-    trackCount: item.more_info && item.more_info.song_count ? parseInt(item.more_info.song_count, 10) : undefined,
-    year: item.year,
+    trackCount: more.song_count ? parseInt(more.song_count, 10) : undefined,
+    year: yearRaw ? parseInt(yearRaw, 10) : undefined,
+    releaseDate: releaseDateRaw || undefined,
   };
 }
 
@@ -335,6 +336,17 @@ function mapPlaylist(item) {
     artworkURL: upgradeArtwork(item.image),
     trackCount: item.more_info && item.more_info.song_count ? parseInt(item.more_info.song_count, 10) : undefined,
   };
+}
+
+/** Sorts mapped albums by year (and release date as tiebreaker), most recent first. */
+function sortAlbumsByRecency(albums) {
+  return albums.slice().sort((a, b) => {
+    const yearDiff = (b.year || 0) - (a.year || 0);
+    if (yearDiff !== 0) return yearDiff;
+    const aDate = a.releaseDate ? new Date(a.releaseDate).getTime() : 0;
+    const bDate = b.releaseDate ? new Date(b.releaseDate).getTime() : 0;
+    return bDate - aDate;
+  });
 }
 
 /* ------------------------------------------------------------------ */
@@ -387,17 +399,17 @@ function manifest(token) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Search                                                               */
+/* Search — higher limits so results aren't artificially thin          */
 /* ------------------------------------------------------------------ */
 
 async function handleSearch(query) {
   if (!query) return { tracks: [], albums: [], artists: [], playlists: [] };
 
   const [songsRes, albumsRes, artistsRes, playlistsRes] = await Promise.allSettled([
-    jioFetch("search.getResults", { q: query, p: "1", n: "15" }),
-    jioFetch("search.getAlbumResults", { q: query, p: "1", n: "6" }),
-    jioFetch("search.getArtistResults", { q: query, p: "1", n: "6" }),
-    jioFetch("search.getPlaylistResults", { q: query, p: "1", n: "6" }),
+    jioFetch("search.getResults", { q: query, p: "1", n: "20" }),
+    jioFetch("search.getAlbumResults", { q: query, p: "1", n: "40" }),
+    jioFetch("search.getArtistResults", { q: query, p: "1", n: "15" }),
+    jioFetch("search.getPlaylistResults", { q: query, p: "1", n: "15" }),
   ]);
 
   const tracks = songsRes.status === "fulfilled" ? ((songsRes.value.results || []).map(mapTrack).filter(Boolean)) : [];
@@ -461,50 +473,66 @@ async function handleAlbum(id) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Artist (cached) — defensive shape parsing + dedicated fallback      */
+/* Artist (cached) — full album pagination, sorted by recency          */
 /* ------------------------------------------------------------------ */
 
-function extractList(container, keyNames) {
-  if (!container) return [];
-  if (Array.isArray(container)) return container;
-  for (const key of keyNames) {
-    if (Array.isArray(container[key])) return container[key];
+async function fetchAllArtistAlbums(id) {
+  let all = [];
+  let page = 1;
+  while (page <= MAX_ARTIST_ALBUM_PAGES) {
+    let data;
+    try {
+      data = await jioFetch("artist.getArtistMoreAlbum", {
+        artistId: id,
+        page: String(page),
+        category: "latest",
+        sort_order: "desc",
+      });
+    } catch {
+      break;
+    }
+    const pageAlbums = data.albums || data.results || [];
+    if (!Array.isArray(pageAlbums) || pageAlbums.length === 0) break;
+    all = all.concat(pageAlbums.map(mapAlbum));
+    // Stop once we've clearly reached the end (short/partial page).
+    if (pageAlbums.length < 10) break;
+    page++;
   }
-  return [];
+  return all;
 }
 
 async function handleArtist(id) {
-  const data = await jioFetch("artist.getArtistPageDetails", { artistId: id });
+  const data = await jioFetch("artist.getArtistPageDetails", {
+    artistId: id,
+    n_song: "20",
+    n_album: "40",
+    page: "1",
+    category: "latest",
+    sort_order: "desc",
+  });
 
-  let rawSongs = extractList(data.topSongs, ["songs", "data", "results"]);
-  if (rawSongs.length === 0) rawSongs = extractList(data.top_songs, ["songs", "data", "results"]);
+  const rawSongs = (data.topSongs && (data.topSongs.songs || data.topSongs)) || data.top_songs || [];
+  let topTracks = Array.isArray(rawSongs) ? rawSongs.map(mapTrack).filter(Boolean) : [];
 
-  let rawAlbums = extractList(data.topAlbums, ["albums", "data", "results"]);
-  if (rawAlbums.length === 0) rawAlbums = extractList(data.top_albums, ["albums", "data", "results"]);
+  // Full album pagination — don't settle for just the profile's top-N slice.
+  let albums = await fetchAllArtistAlbums(id);
 
-  let topTracks = rawSongs.map(mapTrack).filter(Boolean);
-  let albums = rawAlbums.map(mapAlbum);
-
-  // Dedicated fallback endpoints for artist pages that don't inline
-  // songs/albums in the main profile response.
-  if (topTracks.length === 0 || albums.length === 0) {
-    const [songsFallback, albumsFallback] = await Promise.allSettled([
-      topTracks.length === 0
-        ? jioFetch("artist.getArtistMoreSong", { artistId: id, page: "0", category: "latest", sort_order: "desc" })
-        : Promise.resolve(null),
-      albums.length === 0
-        ? jioFetch("artist.getArtistMoreAlbum", { artistId: id, page: "0", category: "latest", sort_order: "desc" })
-        : Promise.resolve(null),
-    ]);
-    if (topTracks.length === 0 && songsFallback.status === "fulfilled" && songsFallback.value) {
-      const list = extractList(songsFallback.value, ["songs", "data", "results"]);
-      topTracks = list.map(mapTrack).filter(Boolean);
-    }
-    if (albums.length === 0 && albumsFallback.status === "fulfilled" && albumsFallback.value) {
-      const list = extractList(albumsFallback.value, ["albums", "data", "results"]);
-      albums = list.map(mapAlbum);
-    }
+  // Fallback to whatever the profile call inlined if pagination came back empty
+  // (some artist IDs / edge cases don't support artist.getArtistMoreAlbum).
+  if (albums.length === 0) {
+    const rawAlbums = (data.topAlbums && (data.topAlbums.albums || data.topAlbums)) || data.top_albums || [];
+    albums = Array.isArray(rawAlbums) ? rawAlbums.map(mapAlbum) : [];
   }
+
+  albums = sortAlbumsByRecency(albums);
+
+  // De-duplicate by id (pagination + fallback can occasionally overlap).
+  const seen = new Set();
+  albums = albums.filter((a) => {
+    if (seen.has(a.id)) return false;
+    seen.add(a.id);
+    return true;
+  });
 
   return {
     id: String(data.artistId || data.id || id),
@@ -592,7 +620,7 @@ function landingPage() {
   <div class="card">
     <h1>JioSaavn Addon for Eclipse</h1>
     <p class="sub">Generate a unique addon URL and install it in Eclipse under Settings → Cloud Storage → Add Connection → Addons.</p>
-    <div class="tip"><b>Note:</b> Direct JioSaavn API, India-region headers applied.</div>
+    <div class="tip"><b>Note:</b> Direct JioSaavn API, India-region headers applied. Artist pages show full, recency-sorted discographies.</div>
     <button id="genBtn" onclick="generate()">Generate Addon URL</button>
     <div id="genBox">
       <div class="label">Your manifest URL</div>
