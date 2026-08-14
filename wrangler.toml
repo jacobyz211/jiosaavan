@@ -1,6 +1,7 @@
 name = "eclipse-jiosaavn-addon"
 main = "index.js"
 compatibility_date = "2024-09-23"
+compatibility_flags = ["global_fetch_strictly_public"]
 
 # Bump this if you rename the deployed Worker
 # workers_dev = true
