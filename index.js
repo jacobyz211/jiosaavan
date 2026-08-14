@@ -3,18 +3,25 @@
  * Wraps your self-hosted jiosaavn-api (https://jiosaavn-api.cyrusna29.workers.dev)
  * and exposes it through the Eclipse addon contract: /manifest.json, /search,
  * /stream/:id, /album/:id, /artist/:id, /playlist/:id — with an OPTIONAL
- * leading /{token}/ path segment, e.g. /abc123/manifest.json, /abc123/search?q=...
+ * leading /{token}/ path segment.
  *
- * Also serves a landing page at "/" (monochrome theme) with a
- * "Generate Addon URL" button that mints a fresh token every press.
- *
- * Caching: Upstash Redis (REST, edge-compatible) with an in-memory Map
- * fallback when UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN aren't
- * configured.
+ * PERFORMANCE NOTES (this version):
+ * 1. Cache writes no longer block the response — on a cache miss, we
+ *    respond as soon as data is ready and write to Redis via
+ *    ctx.waitUntil() in the background.
+ * 2. Every outbound call to jiosaavn-api has a hard timeout (AbortController)
+ *    so one slow endpoint can't stall the whole search — it just drops
+ *    out of the results instead of blocking everything.
+ * 3. Search limits trimmed slightly (fewer albums/artists/playlists
+ *    fetched per query) since Eclipse's UI rarely needs more than a
+ *    handful of each, and smaller JSON payloads parse faster.
+ * 4. Redis reads/writes use short REST timeouts so a flaky cache never
+ *    becomes slower than just hitting the backend directly.
  *
  * Deploy: wrangler deploy
  * Secrets: wrangler secret put UPSTASH_REDIS_REST_URL
  *          wrangler secret put UPSTASH_REDIS_REST_TOKEN
+ * wrangler.toml: compatibility_flags = ["global_fetch_strictly_public"]
  */
 
 import { Redis } from "@upstash/redis/cloudflare";
@@ -24,6 +31,8 @@ const SAAVN_BASE = "https://jiosaavn-api.cyrusna29.workers.dev/api";
 const CACHE_TTL_SEARCH = 60 * 10;      // 10 min
 const CACHE_TTL_DETAIL = 60 * 60;      // 1 hour
 const CACHE_TTL_STREAM = 60 * 15;      // 15 min (download URLs expire)
+
+const FETCH_TIMEOUT_MS = 3500;         // hard cap per backend call
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -118,24 +127,35 @@ function mapPlaylist(playlist) {
   };
 }
 
-async function saavnGet(path) {
-  const fullUrl = `${SAAVN_BASE}${path}`;
-  const res = await fetch(fullUrl, {
-    headers: { "User-Agent": "Mozilla/5.0 (EclipseAddon/1.0)" },
-  });
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`jiosaavn-api ${path} -> HTTP ${res.status} ${text.slice(0, 200)}`);
+/* ------------------------------------------------------------------ */
+/* Backend fetch with a hard timeout so slow endpoints can't stall     */
+/* the whole request.                                                  */
+/* ------------------------------------------------------------------ */
+
+async function saavnGet(path, timeoutMs = FETCH_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(`${SAAVN_BASE}${path}`, {
+      headers: { "User-Agent": "Mozilla/5.0 (EclipseAddon/1.0)" },
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`jiosaavn-api ${path} -> HTTP ${res.status} ${text.slice(0, 200)}`);
+    }
+    const body = await res.json();
+    if (!body.success) {
+      throw new Error(`jiosaavn-api ${path} returned success:false`);
+    }
+    return body.data;
+  } finally {
+    clearTimeout(timer);
   }
-  const body = await res.json();
-  if (!body.success) {
-    throw new Error(`jiosaavn-api ${path} returned success:false ${JSON.stringify(body).slice(0, 200)}`);
-  }
-  return body.data;
 }
 
 /* ------------------------------------------------------------------ */
-/* Upstash Redis + in-memory fallback                                  */
+/* Upstash Redis + in-memory fallback, non-blocking writes             */
 /* ------------------------------------------------------------------ */
 
 const memCache = new Map();
@@ -171,13 +191,20 @@ async function rSet(redis, key, value, ttl) {
   if (memCache.size > 500) memCache.delete(memCache.keys().next().value);
 }
 
-async function withRedisCache(env, key, ttl, fn) {
+// Cache-miss path no longer awaits the write — respond immediately,
+// persist to cache in the background via ctx.waitUntil.
+async function withRedisCache(env, ctx, key, ttl, fn) {
   const redis = getRedis(env);
   const cached = await rGet(redis, key);
   if (cached) return json(cached);
 
   const data = await fn();
-  await rSet(redis, key, data, ttl);
+  const writeBack = rSet(redis, key, data, ttl);
+  if (ctx && typeof ctx.waitUntil === "function") {
+    ctx.waitUntil(writeBack);
+  } else {
+    await writeBack;
+  }
   return json(data);
 }
 
@@ -185,7 +212,7 @@ function manifest(token) {
   return {
     id: token ? `com.eclipse-addons.jiosaavn.${token}` : "com.eclipse-addons.jiosaavn",
     name: "JioSaavn",
-    version: "1.3.0",
+    version: "1.4.0",
     description: "Stream Bollywood, Indian regional, and international tracks from JioSaavn.",
     icon: "https://www.jiosaavn.com/favicon.ico",
     resources: ["search", "stream", "catalog"],
@@ -195,30 +222,25 @@ function manifest(token) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Search — tracks, albums, artists, playlists                         */
+/* Search — trimmed limits, parallel + timed-out per-category calls    */
 /* ------------------------------------------------------------------ */
 
 async function handleSearch(query) {
-  if (!query) return { tracks: [], albums: [], artists: [], playlists: [], errors: [] };
+  if (!query) return { tracks: [], albums: [], artists: [], playlists: [] };
 
   const [songsRes, albumsRes, artistsRes, playlistsRes] = await Promise.allSettled([
-    saavnGet(`/search/songs?query=${encodeURIComponent(query)}&limit=20`),
-    saavnGet(`/search/albums?query=${encodeURIComponent(query)}&limit=10`),
-    saavnGet(`/search/artists?query=${encodeURIComponent(query)}&limit=10`),
-    saavnGet(`/search/playlists?query=${encodeURIComponent(query)}&limit=10`),
+    saavnGet(`/search/songs?query=${encodeURIComponent(query)}&limit=15`),
+    saavnGet(`/search/albums?query=${encodeURIComponent(query)}&limit=6`),
+    saavnGet(`/search/artists?query=${encodeURIComponent(query)}&limit=6`),
+    saavnGet(`/search/playlists?query=${encodeURIComponent(query)}&limit=6`),
   ]);
 
-  const errors = [];
-  const tracks =
-    songsRes.status === "fulfilled" ? (songsRes.value.results || []).map(mapTrack) : (errors.push(`songs: ${songsRes.reason?.message}`), []);
-  const albums =
-    albumsRes.status === "fulfilled" ? (albumsRes.value.results || []).map(mapAlbum) : (errors.push(`albums: ${albumsRes.reason?.message}`), []);
-  const artists =
-    artistsRes.status === "fulfilled" ? (artistsRes.value.results || []).map(mapArtist) : (errors.push(`artists: ${artistsRes.reason?.message}`), []);
-  const playlists =
-    playlistsRes.status === "fulfilled" ? (playlistsRes.value.results || []).map(mapPlaylist) : (errors.push(`playlists: ${playlistsRes.reason?.message}`), []);
+  const tracks = songsRes.status === "fulfilled" ? (songsRes.value.results || []).map(mapTrack) : [];
+  const albums = albumsRes.status === "fulfilled" ? (albumsRes.value.results || []).map(mapAlbum) : [];
+  const artists = artistsRes.status === "fulfilled" ? (artistsRes.value.results || []).map(mapArtist) : [];
+  const playlists = playlistsRes.status === "fulfilled" ? (playlistsRes.value.results || []).map(mapPlaylist) : [];
 
-  return { tracks, albums, artists, playlists, errors: errors.length ? errors : undefined };
+  return { tracks, albums, artists, playlists };
 }
 
 /* ------------------------------------------------------------------ */
@@ -255,29 +277,31 @@ async function handleAlbum(id) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Artist — profile, top tracks, top albums                            */
+/* Artist — profile, top tracks, top albums (parallel fallback calls)  */
 /* ------------------------------------------------------------------ */
 
 async function handleArtist(id) {
-  // Primary artist profile (includes topSongs/topAlbums on jiosaavn-api)
   const artist = await saavnGet(`/artists/${encodeURIComponent(id)}`);
 
   let topTracks = (artist.topSongs || []).map(mapTrack);
   let albums = (artist.topAlbums || []).map(mapAlbum);
 
-  // Fallback: if the profile endpoint didn't inline songs/albums,
-  // hit the dedicated sub-endpoints.
-  if (topTracks.length === 0) {
-    try {
-      const songsRes = await saavnGet(`/artists/${encodeURIComponent(id)}/songs`);
-      topTracks = (songsRes.songs || songsRes.results || []).map(mapTrack);
-    } catch {}
-  }
-  if (albums.length === 0) {
-    try {
-      const albumsRes = await saavnGet(`/artists/${encodeURIComponent(id)}/albums`);
-      albums = (albumsRes.albums || albumsRes.results || []).map(mapAlbum);
-    } catch {}
+  // Run both fallback calls in parallel instead of sequentially —
+  // only fires for artists whose profile didn't inline songs/albums.
+  const needsSongs = topTracks.length === 0;
+  const needsAlbums = albums.length === 0;
+
+  if (needsSongs || needsAlbums) {
+    const [songsFallback, albumsFallback] = await Promise.allSettled([
+      needsSongs ? saavnGet(`/artists/${encodeURIComponent(id)}/songs`) : Promise.resolve(null),
+      needsAlbums ? saavnGet(`/artists/${encodeURIComponent(id)}/albums`) : Promise.resolve(null),
+    ]);
+    if (needsSongs && songsFallback.status === "fulfilled" && songsFallback.value) {
+      topTracks = (songsFallback.value.songs || songsFallback.value.results || []).map(mapTrack);
+    }
+    if (needsAlbums && albumsFallback.status === "fulfilled" && albumsFallback.value) {
+      albums = (albumsFallback.value.albums || albumsFallback.value.results || []).map(mapAlbum);
+    }
   }
 
   return {
@@ -308,7 +332,7 @@ async function handlePlaylist(id) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Token generation — 28 random bytes, lowercase base36 alphabet       */
+/* Token generation                                                     */
 /* ------------------------------------------------------------------ */
 
 function generateToken() {
@@ -323,7 +347,7 @@ function generateToken() {
 }
 
 /* ------------------------------------------------------------------ */
-/* Path parsing — strip an optional leading /{token}/ segment          */
+/* Path parsing                                                        */
 /* ------------------------------------------------------------------ */
 
 function parsePath(pathname) {
@@ -336,7 +360,7 @@ function parsePath(pathname) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Landing page — monochrome dark theme                                */
+/* Landing page                                                        */
 /* ------------------------------------------------------------------ */
 
 function landingPage() {
@@ -421,7 +445,7 @@ function landingPage() {
 }
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     if (request.method === "OPTIONS") {
       return new Response(null, { headers: CORS_HEADERS });
     }
@@ -442,9 +466,6 @@ export default {
         return json({ token: newToken, manifestUrl });
       }
 
-      // Debug route: hits your jiosaavn-api directly so you can verify
-      // connectivity without going through search mapping.
-      // GET /debug?q=drake
       if (rest === "/debug") {
         const q = url.searchParams.get("q") || "drake";
         try {
@@ -462,31 +483,31 @@ export default {
       if (rest === "/search" || rest.startsWith("/search?")) {
         const q = url.searchParams.get("q") || "";
         const cacheKey = `jiosaavn:search:${q.toLowerCase()}`;
-        return withRedisCache(env, cacheKey, CACHE_TTL_SEARCH, () => handleSearch(q));
+        return withRedisCache(env, ctx, cacheKey, CACHE_TTL_SEARCH, () => handleSearch(q));
       }
 
       const streamMatch = rest.match(/^\/stream\/(.+)$/);
       if (streamMatch) {
         const cacheKey = `jiosaavn:stream:${streamMatch[1]}`;
-        return withRedisCache(env, cacheKey, CACHE_TTL_STREAM, () => handleStream(streamMatch[1]));
+        return withRedisCache(env, ctx, cacheKey, CACHE_TTL_STREAM, () => handleStream(streamMatch[1]));
       }
 
       const albumMatch = rest.match(/^\/album\/(.+)$/);
       if (albumMatch) {
         const cacheKey = `jiosaavn:album:${albumMatch[1]}`;
-        return withRedisCache(env, cacheKey, CACHE_TTL_DETAIL, () => handleAlbum(albumMatch[1]));
+        return withRedisCache(env, ctx, cacheKey, CACHE_TTL_DETAIL, () => handleAlbum(albumMatch[1]));
       }
 
       const artistMatch = rest.match(/^\/artist\/(.+)$/);
       if (artistMatch) {
         const cacheKey = `jiosaavn:artist:${artistMatch[1]}`;
-        return withRedisCache(env, cacheKey, CACHE_TTL_DETAIL, () => handleArtist(artistMatch[1]));
+        return withRedisCache(env, ctx, cacheKey, CACHE_TTL_DETAIL, () => handleArtist(artistMatch[1]));
       }
 
       const playlistMatch = rest.match(/^\/playlist\/(.+)$/);
       if (playlistMatch) {
         const cacheKey = `jiosaavn:playlist:${playlistMatch[1]}`;
-        return withRedisCache(env, cacheKey, CACHE_TTL_DETAIL, () => handlePlaylist(playlistMatch[1]));
+        return withRedisCache(env, ctx, cacheKey, CACHE_TTL_DETAIL, () => handlePlaylist(playlistMatch[1]));
       }
 
       return json({ error: "Not found", path: rest }, 404);
