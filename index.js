@@ -11,7 +11,7 @@
  * Deploy: wrangler deploy
  */
 
-const SAAVN_BASE = "https://saavn.dev/api";
+const SAAVN_BASE = "https://jiosaavn-api.cyrusna29.workers.dev";
 const CACHE_TTL_SEARCH = 60 * 10;      // 10 min
 const CACHE_TTL_DETAIL = 60 * 60;      // 1 hour
 const CACHE_TTL_STREAM = 60 * 15;      // 15 min (download URLs expire)
