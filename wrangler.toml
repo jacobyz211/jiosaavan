@@ -1,0 +1,14 @@
+name = "eclipse-jiosaavn-addon"
+main = "index.js"
+compatibility_date = "2024-09-23"
+
+# Bump this if you rename the deployed Worker
+# workers_dev = true
+
+[observability]
+enabled = true
+
+# Optional: attach a custom route once you have a domain on Cloudflare
+# [[routes]]
+# pattern = "jiosaavn-addon.yourdomain.com/*"
+# zone_name = "yourdomain.com"
