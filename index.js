@@ -1,7 +1,7 @@
 /**
  * Eclipse Music addon — JioSaavn
- * Wraps your self-hosted jiosaavn-api (or public saavn.dev as fallback) and
- * exposes it through the Eclipse addon contract: /manifest.json, /search,
+ * Wraps your - -api (or public saavn.dev as fallback) and
+ * exposes it  the Eclipse addon contract: /manifest.json, /search,
  * /stream/:id, /album/:id, /artist/:id, /playlist/:id
  *
  * Also serves a landing page at "/" (monochrome theme) with a
