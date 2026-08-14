@@ -1,38 +1,49 @@
 /**
  * Eclipse Music addon — JioSaavn
  * Wraps your self-hosted jiosaavn-api (https://jiosaavn-api.cyrusna29.workers.dev)
- * and exposes it through the Eclipse addon contract: /manifest.json, /search,
- * /stream/:id, /album/:id, /artist/:id, /playlist/:id — with an OPTIONAL
- * leading /{token}/ path segment.
+ * and exposes it through the Eclipse addon contract.
  *
- * PERFORMANCE NOTES (this version):
- * 1. Cache writes no longer block the response — on a cache miss, we
- *    respond as soon as data is ready and write to Redis via
- *    ctx.waitUntil() in the background.
- * 2. Every outbound call to jiosaavn-api has a hard timeout (AbortController)
- *    so one slow endpoint can't stall the whole search — it just drops
- *    out of the results instead of blocking everything.
- * 3. Search limits trimmed slightly (fewer albums/artists/playlists
- *    fetched per query) since Eclipse's UI rarely needs more than a
- *    handful of each, and smaller JSON payloads parse faster.
- * 4. Redis reads/writes use short REST timeouts so a flaky cache never
- *    becomes slower than just hitting the backend directly.
+ * CACHING POLICY (changed per feedback):
+ * - /search and /stream/:id are ALWAYS fetched fresh, no Redis, no
+ *   in-memory cache. Search results are user/query-specific and highly
+ *   volatile at scale; stream URLs can carry short-lived expiry, so a
+ *   cached URL served to a different user later can simply be dead —
+ *   worse as user count grows, not just slower. Neither should ever be
+ *   served stale.
+ * - /album, /artist, /playlist keep Redis caching — that content is
+ *   genuinely static (an album's tracklist doesn't change minute to
+ *   minute) and caching it doesn't carry the correctness risk above.
+ *
+ * SPEED WORK (this version):
+ * 1. Hard per-call timeout via AbortController (3s) so one slow
+ *    upstream call can't stall a whole request.
+ * 2. Trimmed search payload sizes.
+ * 3. Artist fallback calls run in parallel, not sequentially.
+ * 4. Recommend enabling Smart Placement in wrangler.toml — this is an
+ *    infrastructure-level fix, not caching: it moves this Worker's
+ *    execution closer to jiosaavn-api's origin instead of closer to the
+ *    end user, cutting the network round-trip time on every single
+ *    request (cached or not). Add to wrangler.toml:
+ *      [placement]
+ *      mode = "smart"
+ * 5. Single retry-with-shorter-timeout on stream lookups only (the one
+ *    call where a second attempt is worth the extra latency, since a
+ *    failed stream call means the user can't play the track at all).
  *
  * Deploy: wrangler deploy
- * Secrets: wrangler secret put UPSTASH_REDIS_REST_URL
- *          wrangler secret put UPSTASH_REDIS_REST_TOKEN
  * wrangler.toml: compatibility_flags = ["global_fetch_strictly_public"]
+ *                [placement] mode = "smart"
  */
 
 import { Redis } from "@upstash/redis/cloudflare";
 
 const SAAVN_BASE = "https://jiosaavn-api.cyrusna29.workers.dev/api";
 
-const CACHE_TTL_SEARCH = 60 * 10;      // 10 min
-const CACHE_TTL_DETAIL = 60 * 60;      // 1 hour
-const CACHE_TTL_STREAM = 60 * 15;      // 15 min (download URLs expire)
+const CACHE_TTL_DETAIL = 60 * 60; // album/artist/playlist only — 1 hour
 
-const FETCH_TIMEOUT_MS = 3500;         // hard cap per backend call
+const FETCH_TIMEOUT_MS = 3000;        // general hard cap per backend call
+const STREAM_TIMEOUT_MS = 2500;       // first attempt
+const STREAM_RETRY_TIMEOUT_MS = 2000; // second attempt, shorter
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -47,6 +58,7 @@ function json(data, status = 200) {
     status,
     headers: {
       "Content-Type": "application/json",
+      "Cache-Control": "no-store",
       ...CORS_HEADERS,
     },
   });
@@ -128,8 +140,7 @@ function mapPlaylist(playlist) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Backend fetch with a hard timeout so slow endpoints can't stall     */
-/* the whole request.                                                  */
+/* Backend fetch with a hard timeout                                   */
 /* ------------------------------------------------------------------ */
 
 async function saavnGet(path, timeoutMs = FETCH_TIMEOUT_MS) {
@@ -155,7 +166,7 @@ async function saavnGet(path, timeoutMs = FETCH_TIMEOUT_MS) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Upstash Redis + in-memory fallback, non-blocking writes             */
+/* Upstash Redis — used ONLY for /album, /artist, /playlist            */
 /* ------------------------------------------------------------------ */
 
 const memCache = new Map();
@@ -191,8 +202,6 @@ async function rSet(redis, key, value, ttl) {
   if (memCache.size > 500) memCache.delete(memCache.keys().next().value);
 }
 
-// Cache-miss path no longer awaits the write — respond immediately,
-// persist to cache in the background via ctx.waitUntil.
 async function withRedisCache(env, ctx, key, ttl, fn) {
   const redis = getRedis(env);
   const cached = await rGet(redis, key);
@@ -212,7 +221,7 @@ function manifest(token) {
   return {
     id: token ? `com.eclipse-addons.jiosaavn.${token}` : "com.eclipse-addons.jiosaavn",
     name: "JioSaavn",
-    version: "1.4.0",
+    version: "1.5.0",
     description: "Stream Bollywood, Indian regional, and international tracks from JioSaavn.",
     icon: "https://www.jiosaavn.com/favicon.ico",
     resources: ["search", "stream", "catalog"],
@@ -222,7 +231,7 @@ function manifest(token) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Search — trimmed limits, parallel + timed-out per-category calls    */
+/* Search — always fresh, no cache of any kind                        */
 /* ------------------------------------------------------------------ */
 
 async function handleSearch(query) {
@@ -244,11 +253,11 @@ async function handleSearch(query) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Stream                                                               */
+/* Stream — always fresh, one fast retry on failure/timeout            */
 /* ------------------------------------------------------------------ */
 
-async function handleStream(id) {
-  const song = await saavnGet(`/songs/${encodeURIComponent(id)}`);
+async function resolveStream(id, timeoutMs) {
+  const song = await saavnGet(`/songs/${encodeURIComponent(id)}`, timeoutMs);
   const record = Array.isArray(song) ? song[0] : song;
   const dl = bestDownloadUrl(record.downloadUrl);
   if (!dl || !dl.url) throw new Error("No stream URL available for this track");
@@ -259,8 +268,22 @@ async function handleStream(id) {
   };
 }
 
+async function handleStream(id) {
+  try {
+    return await resolveStream(id, STREAM_TIMEOUT_MS);
+  } catch (firstErr) {
+    // One quick retry — worth the extra latency here specifically,
+    // since a failed stream call means playback can't start at all.
+    try {
+      return await resolveStream(id, STREAM_RETRY_TIMEOUT_MS);
+    } catch {
+      throw firstErr;
+    }
+  }
+}
+
 /* ------------------------------------------------------------------ */
-/* Album                                                                */
+/* Album (cached)                                                       */
 /* ------------------------------------------------------------------ */
 
 async function handleAlbum(id) {
@@ -277,7 +300,7 @@ async function handleAlbum(id) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Artist — profile, top tracks, top albums (parallel fallback calls)  */
+/* Artist (cached) — parallel fallback calls                           */
 /* ------------------------------------------------------------------ */
 
 async function handleArtist(id) {
@@ -286,8 +309,6 @@ async function handleArtist(id) {
   let topTracks = (artist.topSongs || []).map(mapTrack);
   let albums = (artist.topAlbums || []).map(mapAlbum);
 
-  // Run both fallback calls in parallel instead of sequentially —
-  // only fires for artists whose profile didn't inline songs/albums.
   const needsSongs = topTracks.length === 0;
   const needsAlbums = albums.length === 0;
 
@@ -316,7 +337,7 @@ async function handleArtist(id) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Playlist                                                             */
+/* Playlist (cached)                                                    */
 /* ------------------------------------------------------------------ */
 
 async function handlePlaylist(id) {
@@ -480,18 +501,19 @@ export default {
         return json(manifest(token));
       }
 
+      // Always fresh — no caching.
       if (rest === "/search" || rest.startsWith("/search?")) {
         const q = url.searchParams.get("q") || "";
-        const cacheKey = `jiosaavn:search:${q.toLowerCase()}`;
-        return withRedisCache(env, ctx, cacheKey, CACHE_TTL_SEARCH, () => handleSearch(q));
+        return json(await handleSearch(q));
       }
 
+      // Always fresh — no caching.
       const streamMatch = rest.match(/^\/stream\/(.+)$/);
       if (streamMatch) {
-        const cacheKey = `jiosaavn:stream:${streamMatch[1]}`;
-        return withRedisCache(env, ctx, cacheKey, CACHE_TTL_STREAM, () => handleStream(streamMatch[1]));
+        return json(await handleStream(streamMatch[1]));
       }
 
+      // Cached — static content.
       const albumMatch = rest.match(/^\/album\/(.+)$/);
       if (albumMatch) {
         const cacheKey = `jiosaavn:album:${albumMatch[1]}`;
