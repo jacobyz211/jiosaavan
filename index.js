@@ -1,6 +1,6 @@
 /**
  * Eclipse Music addon — JioSaavn
- * Wraps the public unofficial JioSaavn API (saavn.dev) and exposes it
+ * Wraps the  unofficial JioSaavn API (saavn.dev) and exposes it
  * through the Eclipse addon contract: /manifest.json, /search, /stream/:id,
  * /album/:id, /artist/:id, /playlist/:id
  *
