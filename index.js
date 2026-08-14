@@ -1,25 +1,28 @@
 /**
  * Eclipse Music addon — JioSaavn (direct)
  *
- * Talks directly to JioSaavn's raw internal API (api.php). Every call
- * carries spoofed India geo headers so India-licensed catalog is
- * unlocked without a middle-hop backend.
+ * Talks directly to JioSaavn's raw internal API (api.php) with spoofed
+ * India geo headers.
  *
- * STREAM URL POLICY (this version):
- * No bitrate substitution at all. Previous versions tried to force or
- * "confirm" a specific bitrate (320/160) by rewriting the URL suffix,
- * which added a decision step and could point at a mismatched/slow
- * path before playback started. Now resolveStream() just decrypts
- * whatever URL JioSaavn actually hands back and returns it AS-IS —
- * whatever quality that naturally is, is what plays, immediately.
+ * THIS VERSION FIXES:
+ * 1. Missing artist top tracks/albums — artist.getArtistPageDetails
+ *    doesn't nest topSongs/topAlbums the same way for every artist.
+ *    Now checks many possible shapes, and if still empty, falls back
+ *    to dedicated artist.getArtistMoreSong / artist.getArtistMoreAlbum
+ *    calls (JioSaavn's own paginated artist-page endpoints).
+ * 2. White/blank profile pictures — upgradeArtwork() now returns
+ *    undefined (omitted from JSON) instead of "" when there's no
+ *    image, so Eclipse falls back to its own placeholder UI instead
+ *    of trying to load an empty src. Also guards against `image`
+ *    coming back as an array instead of a string (some endpoints
+ *    return it differently), and upgrades ANY embedded size token to
+ *    500x500 instead of only three hardcoded ones — improves hit rate
+ *    for higher-res artwork across tracks, albums, and artist photos.
  *
- * SPEED:
- * Single hop (addon -> JioSaavn directly). Remaining lever is
- * infrastructure — add to wrangler.toml:
- *   [placement]
- *   mode = "smart"
+ * STREAM URL POLICY (unchanged): decrypt and return AS-IS, no bitrate
+ * substitution.
  *
- * CACHING POLICY:
+ * CACHING POLICY (unchanged):
  * - /search and /stream/:id are ALWAYS fetched fresh, no cache.
  * - /album, /artist, /playlist are cached via Upstash Redis.
  *
@@ -209,9 +212,28 @@ function sanitizeText(text) {
   return String(text).replace(/&quot;/g, '"').replace(/&amp;/g, "&").replace(/&#039;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">");
 }
 
-function upgradeArtwork(url) {
-  if (!url) return "";
-  return url.replace("http:", "https:").replace(/-(50x50|150x150|250x250)\./g, "-500x500.");
+/**
+ * Returns undefined (not "") when there's no usable image, so it gets
+ * OMITTED from the JSON response entirely — Eclipse should fall back
+ * to its own placeholder UI for a missing field rather than trying to
+ * load an empty src, which is what was likely rendering as a blank
+ * white box.
+ *
+ * Also guards against `image` arriving as an array (quality-tiered
+ * format some endpoints use) instead of a plain string, and upgrades
+ * ANY embedded "-{width}x{height}." size token to 500x500 instead of
+ * only three hardcoded sizes.
+ */
+function upgradeArtwork(image) {
+  let url = image;
+  if (Array.isArray(image)) {
+    if (image.length === 0) return undefined;
+    const last = image[image.length - 1];
+    url = last && (last.url || last.link);
+  }
+  if (!url || typeof url !== "string") return undefined;
+  const upgraded = url.replace("http:", "https:").replace(/-\d+x\d+\./, "-500x500.");
+  return upgraded;
 }
 
 function formatArtist(item) {
@@ -355,8 +377,8 @@ function manifest(token) {
   return {
     id: token ? `com.eclipse-addons.jiosaavn.${token}` : "com.eclipse-addons.jiosaavn",
     name: "JioSaavn",
-    version: "2.2.0",
-    description: "Stream Bollywood, Indian regional, and international tracks from JioSaavn — direct API, India-region headers, no forced bitrate.",
+    version: "2.3.0",
+    description: "Stream Bollywood, Indian regional, and international tracks from JioSaavn.",
     icon: "https://www.jiosaavn.com/favicon.ico",
     resources: ["search", "stream", "catalog"],
     types: ["track", "album", "artist", "playlist"],
@@ -398,9 +420,6 @@ async function resolveStream(id, timeoutMs) {
   const encUrl = more.encrypted_media_url || songObj.encrypted_media_url;
   if (!encUrl) throw new Error("No encrypted media URL found for this track");
 
-  // Decrypt and hand back exactly what JioSaavn gave us. No suffix
-  // rewriting, no "confirmed bitrate" check, no second-guessing —
-  // whatever quality this naturally decrypts to is what plays.
   const finalUrl = DES.decrypt(encUrl, DES_KEY);
   const bitrateMatch = finalUrl.match(/_(\d+)\.(mp4|mp3)$/i);
 
@@ -442,17 +461,50 @@ async function handleAlbum(id) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Artist (cached)                                                      */
+/* Artist (cached) — defensive shape parsing + dedicated fallback      */
 /* ------------------------------------------------------------------ */
+
+function extractList(container, keyNames) {
+  if (!container) return [];
+  if (Array.isArray(container)) return container;
+  for (const key of keyNames) {
+    if (Array.isArray(container[key])) return container[key];
+  }
+  return [];
+}
 
 async function handleArtist(id) {
   const data = await jioFetch("artist.getArtistPageDetails", { artistId: id });
 
-  const rawSongs = (data.topSongs && (data.topSongs.songs || data.topSongs)) || data.top_songs || [];
-  const rawAlbums = (data.topAlbums && (data.topAlbums.albums || data.topAlbums)) || data.top_albums || [];
+  let rawSongs = extractList(data.topSongs, ["songs", "data", "results"]);
+  if (rawSongs.length === 0) rawSongs = extractList(data.top_songs, ["songs", "data", "results"]);
 
-  const topTracks = Array.isArray(rawSongs) ? rawSongs.map(mapTrack).filter(Boolean) : [];
-  const albums = Array.isArray(rawAlbums) ? rawAlbums.map(mapAlbum) : [];
+  let rawAlbums = extractList(data.topAlbums, ["albums", "data", "results"]);
+  if (rawAlbums.length === 0) rawAlbums = extractList(data.top_albums, ["albums", "data", "results"]);
+
+  let topTracks = rawSongs.map(mapTrack).filter(Boolean);
+  let albums = rawAlbums.map(mapAlbum);
+
+  // Dedicated fallback endpoints for artist pages that don't inline
+  // songs/albums in the main profile response.
+  if (topTracks.length === 0 || albums.length === 0) {
+    const [songsFallback, albumsFallback] = await Promise.allSettled([
+      topTracks.length === 0
+        ? jioFetch("artist.getArtistMoreSong", { artistId: id, page: "0", category: "latest", sort_order: "desc" })
+        : Promise.resolve(null),
+      albums.length === 0
+        ? jioFetch("artist.getArtistMoreAlbum", { artistId: id, page: "0", category: "latest", sort_order: "desc" })
+        : Promise.resolve(null),
+    ]);
+    if (topTracks.length === 0 && songsFallback.status === "fulfilled" && songsFallback.value) {
+      const list = extractList(songsFallback.value, ["songs", "data", "results"]);
+      topTracks = list.map(mapTrack).filter(Boolean);
+    }
+    if (albums.length === 0 && albumsFallback.status === "fulfilled" && albumsFallback.value) {
+      const list = extractList(albumsFallback.value, ["albums", "data", "results"]);
+      albums = list.map(mapAlbum);
+    }
+  }
 
   return {
     id: String(data.artistId || data.id || id),
@@ -540,7 +592,7 @@ function landingPage() {
   <div class="card">
     <h1>JioSaavn Addon for Eclipse</h1>
     <p class="sub">Generate a unique addon URL and install it in Eclipse under Settings → Cloud Storage → Add Connection → Addons.</p>
-    <div class="tip"><b>Note:</b> Direct JioSaavn API, India-region headers applied. Streams play at whatever bitrate JioSaavn natively provides — no forced quality.</div>
+    <div class="tip"><b>Note:</b> Direct JioSaavn API, India-region headers applied.</div>
     <button id="genBtn" onclick="generate()">Generate Addon URL</button>
     <div id="genBox">
       <div class="label">Your manifest URL</div>
