@@ -5,7 +5,7 @@
  * /album/:id, /artist/:id, /playlist/:id
  *
  * Also serves a small landing page at "/" (styled after monochrome /
- * qobuz-tidal-eclipse) with a "Generate Addon URL" button that mints a
+ * th a "Generate Addon URL" button that mints a
  * fresh token every press via POST /generate.
  *
  * Deploy: wrangler deploy
