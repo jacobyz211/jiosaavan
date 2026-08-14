@@ -1,18 +1,9 @@
 /**
  * Eclipse Music addon — JioSaavn
- * Wraps your self-hosted jiosaavn-api and exposes it through the Eclipse
- * addon contract: /manifest.json, /search, /stream/:id, /album/:id,
- * /artist/:id, /playlist/:id — with an OPTIONAL leading /{token}/ path
- * segment, e.g. /abc123/manifest.json, /abc123/search?q=...
- *
- * IMPORTANT FIX: the token now lives in the URL PATH, not a query string.
- * Eclipse builds follow-up requests (search, stream, etc.) by stripping
- * "manifest.json" off the end of your installed manifest URL and
- * appending the new path segment. If the token were a query param
- * (?token=xyz), that string-append logic corrupts the URL — which is
- * exactly what was happening (`/manifest.json?token=xyz/search?q=...`).
- * With the token as a path segment, Eclipse's append logic produces a
- * clean `/xyz/search?q=...`, which this Worker parses correctly below.
+ * Wraps your self-hosted jiosaavn-api (https://jiosaavn-api.cyrusna29.workers.dev)
+ * and exposes it through the Eclipse addon contract: /manifest.json, /search,
+ * /stream/:id, /album/:id, /artist/:id, /playlist/:id — with an OPTIONAL
+ * leading /{token}/ path segment, e.g. /abc123/manifest.json, /abc123/search?q=...
  *
  * Also serves a landing page at "/" (monochrome theme) with a
  * "Generate Addon URL" button that mints a fresh token every press.
@@ -28,8 +19,7 @@
 
 import { Redis } from "@upstash/redis/cloudflare";
 
-// Point this at your self-hosted jiosaavn-api Worker's URL + "/api"
-const SAAVN_BASE = "https://YOUR-JIOSAAVN-API.workers.dev/api";
+const SAAVN_BASE = "https://jiosaavn-api.cyrusna29.workers.dev/api";
 
 const CACHE_TTL_SEARCH = 60 * 10;      // 10 min
 const CACHE_TTL_DETAIL = 60 * 60;      // 1 hour
@@ -41,8 +31,7 @@ const CORS_HEADERS = {
   "Access-Control-Allow-Headers": "Content-Type",
 };
 
-// Route names recognized at the root of the path (no token prefix)
-const KNOWN_ROUTES = new Set(["manifest.json", "search", "stream", "album", "artist", "playlist", "generate"]);
+const KNOWN_ROUTES = new Set(["manifest.json", "search", "stream", "album", "artist", "playlist", "generate", "debug"]);
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -130,12 +119,18 @@ function mapPlaylist(playlist) {
 }
 
 async function saavnGet(path) {
-  const res = await fetch(`${SAAVN_BASE}${path}`, {
+  const fullUrl = `${SAAVN_BASE}${path}`;
+  const res = await fetch(fullUrl, {
     headers: { "User-Agent": "Mozilla/5.0 (EclipseAddon/1.0)" },
   });
-  if (!res.ok) throw new Error(`jiosaavn-api ${path} -> ${res.status}`);
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`jiosaavn-api ${path} -> HTTP ${res.status} ${text.slice(0, 200)}`);
+  }
   const body = await res.json();
-  if (!body.success) throw new Error(`jiosaavn-api ${path} returned success:false`);
+  if (!body.success) {
+    throw new Error(`jiosaavn-api ${path} returned success:false ${JSON.stringify(body).slice(0, 200)}`);
+  }
   return body.data;
 }
 
@@ -190,7 +185,7 @@ function manifest(token) {
   return {
     id: token ? `com.eclipse-addons.jiosaavn.${token}` : "com.eclipse-addons.jiosaavn",
     name: "JioSaavn",
-    version: "1.2.0",
+    version: "1.3.0",
     description: "Stream Bollywood, Indian regional, and international tracks from JioSaavn.",
     icon: "https://www.jiosaavn.com/favicon.ico",
     resources: ["search", "stream", "catalog"],
@@ -199,8 +194,12 @@ function manifest(token) {
   };
 }
 
+/* ------------------------------------------------------------------ */
+/* Search — tracks, albums, artists, playlists                         */
+/* ------------------------------------------------------------------ */
+
 async function handleSearch(query) {
-  if (!query) return { tracks: [], albums: [], artists: [], playlists: [] };
+  if (!query) return { tracks: [], albums: [], artists: [], playlists: [], errors: [] };
 
   const [songsRes, albumsRes, artistsRes, playlistsRes] = await Promise.allSettled([
     saavnGet(`/search/songs?query=${encodeURIComponent(query)}&limit=20`),
@@ -209,19 +208,22 @@ async function handleSearch(query) {
     saavnGet(`/search/playlists?query=${encodeURIComponent(query)}&limit=10`),
   ]);
 
+  const errors = [];
   const tracks =
-    songsRes.status === "fulfilled" ? (songsRes.value.results || []).map(mapTrack) : [];
+    songsRes.status === "fulfilled" ? (songsRes.value.results || []).map(mapTrack) : (errors.push(`songs: ${songsRes.reason?.message}`), []);
   const albums =
-    albumsRes.status === "fulfilled" ? (albumsRes.value.results || []).map(mapAlbum) : [];
+    albumsRes.status === "fulfilled" ? (albumsRes.value.results || []).map(mapAlbum) : (errors.push(`albums: ${albumsRes.reason?.message}`), []);
   const artists =
-    artistsRes.status === "fulfilled" ? (artistsRes.value.results || []).map(mapArtist) : [];
+    artistsRes.status === "fulfilled" ? (artistsRes.value.results || []).map(mapArtist) : (errors.push(`artists: ${artistsRes.reason?.message}`), []);
   const playlists =
-    playlistsRes.status === "fulfilled"
-      ? (playlistsRes.value.results || []).map(mapPlaylist)
-      : [];
+    playlistsRes.status === "fulfilled" ? (playlistsRes.value.results || []).map(mapPlaylist) : (errors.push(`playlists: ${playlistsRes.reason?.message}`), []);
 
-  return { tracks, albums, artists, playlists };
+  return { tracks, albums, artists, playlists, errors: errors.length ? errors : undefined };
 }
+
+/* ------------------------------------------------------------------ */
+/* Stream                                                               */
+/* ------------------------------------------------------------------ */
 
 async function handleStream(id) {
   const song = await saavnGet(`/songs/${encodeURIComponent(id)}`);
@@ -234,6 +236,10 @@ async function handleStream(id) {
     quality: dl.quality || "320kbps",
   };
 }
+
+/* ------------------------------------------------------------------ */
+/* Album                                                                */
+/* ------------------------------------------------------------------ */
 
 async function handleAlbum(id) {
   const album = await saavnGet(`/albums?id=${encodeURIComponent(id)}`);
@@ -248,18 +254,46 @@ async function handleAlbum(id) {
   };
 }
 
+/* ------------------------------------------------------------------ */
+/* Artist — profile, top tracks, top albums                            */
+/* ------------------------------------------------------------------ */
+
 async function handleArtist(id) {
+  // Primary artist profile (includes topSongs/topAlbums on jiosaavn-api)
   const artist = await saavnGet(`/artists/${encodeURIComponent(id)}`);
+
+  let topTracks = (artist.topSongs || []).map(mapTrack);
+  let albums = (artist.topAlbums || []).map(mapAlbum);
+
+  // Fallback: if the profile endpoint didn't inline songs/albums,
+  // hit the dedicated sub-endpoints.
+  if (topTracks.length === 0) {
+    try {
+      const songsRes = await saavnGet(`/artists/${encodeURIComponent(id)}/songs`);
+      topTracks = (songsRes.songs || songsRes.results || []).map(mapTrack);
+    } catch {}
+  }
+  if (albums.length === 0) {
+    try {
+      const albumsRes = await saavnGet(`/artists/${encodeURIComponent(id)}/albums`);
+      albums = (albumsRes.albums || albumsRes.results || []).map(mapAlbum);
+    } catch {}
+  }
+
   return {
     id: artist.id,
     name: decodeEntities(artist.name),
     artworkURL: bestImage(artist.image),
     bio: artist.bio ? decodeEntities(Array.isArray(artist.bio) ? artist.bio[0]?.text : artist.bio) : undefined,
     genres: [],
-    topTracks: (artist.topSongs || []).map(mapTrack),
-    albums: (artist.topAlbums || []).map(mapAlbum),
+    topTracks,
+    albums,
   };
 }
+
+/* ------------------------------------------------------------------ */
+/* Playlist                                                             */
+/* ------------------------------------------------------------------ */
 
 async function handlePlaylist(id) {
   const playlist = await saavnGet(`/playlists?id=${encodeURIComponent(id)}`);
@@ -298,7 +332,6 @@ function parsePath(pathname) {
   if (KNOWN_ROUTES.has(parts[0])) {
     return { token: null, rest: "/" + parts.join("/") };
   }
-  // first segment isn't a known route name -> treat it as the token
   return { token: parts[0], rest: "/" + parts.slice(1).join("/") };
 }
 
@@ -407,6 +440,19 @@ export default {
         const newToken = generateToken();
         const manifestUrl = `${url.origin}/${newToken}/manifest.json`;
         return json({ token: newToken, manifestUrl });
+      }
+
+      // Debug route: hits your jiosaavn-api directly so you can verify
+      // connectivity without going through search mapping.
+      // GET /debug?q=drake
+      if (rest === "/debug") {
+        const q = url.searchParams.get("q") || "drake";
+        try {
+          const raw = await saavnGet(`/search/songs?query=${encodeURIComponent(q)}&limit=3`);
+          return json({ ok: true, base: SAAVN_BASE, sample: raw });
+        } catch (err) {
+          return json({ ok: false, base: SAAVN_BASE, error: err.message }, 502);
+        }
       }
 
       if (rest === "/manifest.json") {
