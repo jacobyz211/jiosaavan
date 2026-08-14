@@ -1,50 +1,199 @@
 /**
- * Eclipse Music addon — JioSaavn
- * Wraps your self-hosted jiosaavn-api (https://jiosaavn-api.cyrusna29.workers.dev)
- * and exposes it through the Eclipse addon contract.
+ * Eclipse Music addon — JioSaavn (direct)
  *
- * CACHING POLICY:
- * - /search and /stream/:id are ALWAYS fetched fresh, no Redis, no
- *   in-memory cache.
- * - /album, /artist, /playlist keep Redis caching.
+ * Talks directly to JioSaavn's raw internal API (api.php) instead of
+ * going through the self-hosted jiosaavn-api backend. This was the only
+ * remaining way to make the spoofed India geo headers actually take
+ * effect — they have to be on the request that hits JioSaavn's real
+ * servers, and the jiosaavn-api backend wasn't forwarding them.
  *
- * REGION HEADERS (new):
- * Every outbound call to jiosaavn-api now carries spoofed India geo
- * headers (X-Forwarded-For / Client-IP set to an Indian IP range, plus
- * a JioSaavn language cookie covering English + regional languages).
- * If your jiosaavn-api backend forwards/respects these on its own
- * request to JioSaavn's real servers, this unlocks India-licensed
- * catalog (mainstream Western tracks included) the same way a VPN set
- * to India would. No architecture changes otherwise.
+ * Every outbound call carries:
+ *  - X-Forwarded-For / Client-IP set to an Indian IP
+ *  - a JioSaavn language cookie covering English + regional languages
+ * This mirrors the working reference addon you found.
+ *
+ * Stream URLs come back DES-ECB encrypted from JioSaavn and are
+ * decrypted here (standard JioSaavn client-side scheme, key "38346591").
+ *
+ * CACHING POLICY (unchanged from before):
+ * - /search and /stream/:id are ALWAYS fetched fresh, no cache.
+ * - /album, /artist, /playlist are cached via Upstash Redis.
  *
  * Deploy: wrangler deploy
  * wrangler.toml: compatibility_flags = ["global_fetch_strictly_public"]
- *                [placement] mode = "smart"
  */
 
 import { Redis } from "@upstash/redis/cloudflare";
 
-const SAAVN_BASE = "https://jiosaavn-api.cyrusna29.workers.dev/api";
+/* ------------------------------------------------------------------ */
+/* DES-ECB decryption (JioSaavn's media URL encryption scheme)         */
+/* ------------------------------------------------------------------ */
 
-const CACHE_TTL_DETAIL = 60 * 60; // album/artist/playlist only — 1 hour
+const DES = (function () {
+  const IP = [58,50,42,34,26,18,10,2,60,52,44,36,28,20,12,4,62,54,46,38,30,22,14,6,64,56,48,40,32,24,16,8,57,49,41,33,25,17,9,1,59,51,43,35,27,19,11,3,61,53,45,37,29,21,13,5,63,55,47,39,31,23,15,7];
+  const FP = [40,8,48,16,56,24,64,32,39,7,47,15,55,23,63,31,38,6,46,14,54,22,62,30,37,5,45,13,53,21,61,29,36,4,44,12,52,20,60,28,35,3,43,11,51,19,59,27,34,2,42,10,50,18,58,26,33,1,41,9,49,17,57,25];
+  const E = [32,1,2,3,4,5,4,5,6,7,8,9,8,9,10,11,12,13,12,13,14,15,16,17,16,17,18,19,20,21,20,21,22,23,24,25,24,25,26,27,28,29,28,29,30,31,32,1];
+  const P = [16,7,20,21,29,12,28,17,1,15,23,26,5,18,31,10,2,8,24,14,32,27,3,9,19,13,30,6,22,11,4,25];
+  const S = [
+    [14,4,13,1,2,15,11,8,3,10,6,12,5,9,0,7,0,15,7,4,14,2,13,1,10,6,12,11,9,5,3,8,4,1,14,8,13,6,2,11,15,12,9,7,3,10,5,0,15,12,8,2,4,9,1,7,5,11,3,14,10,0,6,13],
+    [15,1,8,14,6,11,3,4,9,7,2,13,12,0,5,10,3,13,4,7,15,2,8,14,12,0,1,10,6,9,11,5,0,14,7,11,10,4,13,1,5,8,12,6,9,3,2,15,13,8,10,1,3,15,4,2,11,6,7,12,0,5,14,9],
+    [10,0,9,14,6,3,15,5,1,13,12,7,11,4,2,8,13,7,0,9,3,4,6,10,2,8,5,14,12,11,15,1,13,6,4,9,8,15,3,0,11,1,2,12,5,10,14,7,1,10,13,0,6,9,8,7,4,15,14,3,11,5,2,12],
+    [7,13,14,3,0,6,9,10,1,2,8,5,11,12,4,15,13,8,11,5,6,15,0,3,4,7,2,12,1,10,14,9,10,6,9,0,12,11,7,13,15,1,3,14,5,2,8,4,3,15,0,6,10,1,13,8,9,4,5,11,12,7,2,14],
+    [2,12,4,1,7,10,11,6,8,5,3,15,13,0,14,9,14,11,2,12,4,7,13,1,5,0,15,10,3,9,8,6,4,2,1,11,10,13,7,8,15,9,12,5,6,3,0,14,11,8,12,7,1,14,2,13,6,15,0,9,10,4,5,3],
+    [12,1,10,15,9,2,6,8,0,13,3,4,14,7,5,11,10,15,4,2,7,12,9,5,6,1,13,14,0,11,3,8,9,14,15,5,2,8,12,3,7,0,4,10,1,13,11,6,4,3,2,12,9,5,15,10,11,14,1,7,6,0,8,13],
+    [4,11,2,14,15,0,8,13,3,12,9,7,5,10,6,1,13,0,11,7,4,9,1,10,14,3,5,12,2,15,8,6,1,4,11,13,12,3,7,14,10,15,6,8,0,5,9,2,6,11,13,8,1,4,10,7,9,5,0,15,14,2,3,12],
+    [13,2,8,4,6,15,11,1,10,9,3,14,5,0,12,7,1,15,13,8,10,3,7,4,12,5,6,11,0,14,9,2,7,11,4,1,9,12,14,2,0,6,10,13,15,3,5,8,2,1,14,7,4,10,8,13,15,12,9,0,3,5,6,11],
+  ];
+  const PC1 = [57,49,41,33,25,17,9,1,58,50,42,34,26,18,10,2,59,51,43,35,27,19,11,3,60,52,44,36,63,55,47,39,31,23,15,7,62,54,46,38,30,22,14,6,61,53,45,37,29,21,13,5,28,20,12,4];
+  const PC2 = [14,17,11,24,1,5,3,28,15,6,21,10,23,19,12,4,26,8,16,7,27,20,13,2,41,52,31,37,47,55,30,40,51,45,33,48,44,49,39,56,34,53,46,42,50,36,29,32];
+  const SHIFTS = [1,1,2,2,2,2,2,2,1,2,2,2,2,2,2,1];
 
-const FETCH_TIMEOUT_MS = 3000;
-const STREAM_TIMEOUT_MS = 2500;
-const STREAM_RETRY_TIMEOUT_MS = 2000;
+  function permute(bits, table) {
+    const out = new Array(table.length);
+    for (let i = 0; i < table.length; i++) out[i] = bits[table[i] - 1];
+    return out;
+  }
 
-// Spoofed India geo headers — sent on every outbound call.
+  function bytesToBits(bytes) {
+    const bits = [];
+    for (let i = 0; i < bytes.length; i++) {
+      for (let j = 7; j >= 0; j--) bits.push((bytes[i] >> j) & 1);
+    }
+    return bits;
+  }
+
+  function bitsToBytes(bits) {
+    const bytes = new Uint8Array(bits.length / 8);
+    for (let i = 0; i < bytes.length; i++) {
+      let val = 0;
+      for (let j = 0; j < 8; j++) val = (val << 1) | bits[i * 8 + j];
+      bytes[i] = val;
+    }
+    return bytes;
+  }
+
+  function generateSubkeys(keyBytes) {
+    const keyBits = bytesToBits(keyBytes);
+    const pc1Bits = permute(keyBits, PC1);
+    let C = pc1Bits.slice(0, 28);
+    let D = pc1Bits.slice(28, 56);
+    const subkeys = [];
+    for (let r = 0; r < 16; r++) {
+      const shift = SHIFTS[r];
+      C = C.slice(shift).concat(C.slice(0, shift));
+      D = D.slice(shift).concat(D.slice(0, shift));
+      subkeys.push(permute(C.concat(D), PC2));
+    }
+    return subkeys;
+  }
+
+  function feistel(R, K) {
+    const expandedR = permute(R, E);
+    const xored = new Array(48);
+    for (let i = 0; i < 48; i++) xored[i] = expandedR[i] ^ K[i];
+    const sOutput = new Array(32);
+    for (let i = 0; i < 8; i++) {
+      const chunk = xored.slice(i * 6, (i + 1) * 6);
+      const row = (chunk[0] << 1) | chunk[5];
+      const col = (chunk[1] << 3) | (chunk[2] << 2) | (chunk[3] << 1) | chunk[4];
+      const val = S[i][row * 16 + col];
+      sOutput[i * 4] = (val >> 3) & 1;
+      sOutput[i * 4 + 1] = (val >> 2) & 1;
+      sOutput[i * 4 + 2] = (val >> 1) & 1;
+      sOutput[i * 4 + 3] = val & 1;
+    }
+    return permute(sOutput, P);
+  }
+
+  function decryptBlock(blockBytes, subkeys) {
+    const blockBits = bytesToBits(blockBytes);
+    const permutedBlock = permute(blockBits, IP);
+    let L = permutedBlock.slice(0, 32);
+    let R = permutedBlock.slice(32, 64);
+    for (let r = 15; r >= 0; r--) {
+      const temp = R;
+      const fOut = feistel(R, subkeys[r]);
+      const newR = new Array(32);
+      for (let i = 0; i < 32; i++) newR[i] = L[i] ^ fOut[i];
+      L = temp;
+      R = newR;
+    }
+    return bitsToBytes(permute(R.concat(L), FP));
+  }
+
+  const B64_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+  function parseBase64(b64) {
+    const str = b64.replace(/[^A-Za-z0-9+/=]/g, "");
+    let binStr = "";
+    for (let i = 0; i < str.length; i += 4) {
+      const enc1 = B64_CHARS.indexOf(str.charAt(i));
+      const enc2 = B64_CHARS.indexOf(str.charAt(i + 1));
+      const enc3 = B64_CHARS.indexOf(str.charAt(i + 2));
+      const enc4 = B64_CHARS.indexOf(str.charAt(i + 3));
+      const chr1 = (enc1 << 2) | (enc2 >> 4);
+      const chr2 = ((enc2 & 15) << 4) | (enc3 >> 2);
+      const chr3 = ((enc3 & 3) << 6) | enc4;
+      binStr += String.fromCharCode(chr1);
+      if (enc3 !== 64 && enc3 !== -1 && str.charAt(i + 2) !== "=") binStr += String.fromCharCode(chr2);
+      if (enc4 !== 64 && enc4 !== -1 && str.charAt(i + 3) !== "=") binStr += String.fromCharCode(chr3);
+    }
+    return binStr;
+  }
+
+  function base64ToBytes(b64) {
+    const binStr = typeof atob === "function" ? atob(b64) : parseBase64(b64);
+    const bytes = new Uint8Array(binStr.length);
+    for (let i = 0; i < binStr.length; i++) bytes[i] = binStr.charCodeAt(i);
+    return bytes;
+  }
+
+  function bytesToUtf8(bytes) {
+    if (typeof TextDecoder !== "undefined") return new TextDecoder("utf-8").decode(bytes);
+    let str = "";
+    for (let i = 0; i < bytes.length; i++) str += String.fromCharCode(bytes[i]);
+    return decodeURIComponent(escape(str));
+  }
+
+  function decrypt(encryptedB64, keyStr) {
+    const keyBytes = new Uint8Array(8);
+    for (let i = 0; i < 8 && i < keyStr.length; i++) keyBytes[i] = keyStr.charCodeAt(i);
+    const subkeys = generateSubkeys(keyBytes);
+    const cipherBytes = base64ToBytes(encryptedB64);
+    if (cipherBytes.length % 8 !== 0) throw new Error("Invalid cipher text length");
+    const decryptedBytes = new Uint8Array(cipherBytes.length);
+    for (let i = 0; i < cipherBytes.length; i += 8) {
+      decryptedBytes.set(decryptBlock(cipherBytes.subarray(i, i + 8), subkeys), i);
+    }
+    const padLen = decryptedBytes[decryptedBytes.length - 1];
+    if (padLen > 0 && padLen <= 8) {
+      let validPad = true;
+      for (let i = decryptedBytes.length - padLen; i < decryptedBytes.length; i++) {
+        if (decryptedBytes[i] !== padLen) { validPad = false; break; }
+      }
+      if (validPad) return bytesToUtf8(decryptedBytes.subarray(0, decryptedBytes.length - padLen));
+    }
+    return bytesToUtf8(decryptedBytes);
+  }
+
+  return { decrypt };
+})();
+
+/* ------------------------------------------------------------------ */
+/* JioSaavn raw API config                                             */
+/* ------------------------------------------------------------------ */
+
+const API_BASE = "https://www.jiosaavn.com/api.php";
+const DES_KEY = "38346591";
+
 const INDIA_IP = "49.36.0.1";
 const INDIA_LANGUAGE_COOKIE =
   "L=english%2Chindi%2Cpunjabi%2Ctamil%2Ctelugu%2Cmarathi%2Cgujarati%2Cbengali%2Ckannada%2Cmalayalam%2Cbhojpuri%2Crajasthani%2Curdu%2Charyanvi; gdpr_acceptance=true;";
 
-function regionHeaders() {
-  return {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "X-Forwarded-For": INDIA_IP,
-    "Client-IP": INDIA_IP,
-    "Cookie": INDIA_LANGUAGE_COOKIE,
-  };
-}
+const FETCH_TIMEOUT_MS = 3500;
+const STREAM_TIMEOUT_MS = 3000;
+const STREAM_RETRY_TIMEOUT_MS = 2500;
+const CACHE_TTL_DETAIL = 60 * 60;
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -57,113 +206,121 @@ const KNOWN_ROUTES = new Set(["manifest.json", "search", "stream", "album", "art
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: {
-      "Content-Type": "application/json",
-      "Cache-Control": "no-store",
-      ...CORS_HEADERS,
-    },
+    headers: { "Content-Type": "application/json", "Cache-Control": "no-store", ...CORS_HEADERS },
   });
 }
 
-function decodeEntities(str) {
-  if (!str) return str;
-  return str
-    .replace(/&quot;/g, '"')
-    .replace(/&amp;/g, "&")
-    .replace(/&#039;/g, "'")
-    .replace(/&apos;/g, "'")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">");
+function sanitizeText(text) {
+  if (!text) return "";
+  return String(text).replace(/&quot;/g, '"').replace(/&amp;/g, "&").replace(/&#039;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">");
 }
 
-function bestImage(images) {
-  if (!Array.isArray(images) || images.length === 0) return undefined;
-  return images[images.length - 1].url || images[images.length - 1].link;
+function upgradeArtwork(url) {
+  if (!url) return "";
+  return url.replace("http:", "https:").replace(/-(50x50|150x150|250x250)\./g, "-500x500.");
 }
 
-function bestDownloadUrl(downloadUrls) {
-  if (!Array.isArray(downloadUrls) || downloadUrls.length === 0) return null;
-  const last = downloadUrls[downloadUrls.length - 1];
-  return { url: last.url || last.link, quality: last.quality };
-}
-
-function artistNames(song) {
-  if (song.artists && song.artists.primary && song.artists.primary.length) {
-    return song.artists.primary.map((a) => decodeEntities(a.name)).join(", ");
+function formatArtist(item) {
+  if (!item) return "Unknown Artist";
+  const more = item.more_info || {};
+  if (more.artistMap && more.artistMap.primary_artists && more.artistMap.primary_artists.length) {
+    return more.artistMap.primary_artists.map((a) => a.name).join(", ");
   }
-  if (song.primaryArtists) return decodeEntities(song.primaryArtists);
-  if (song.subtitle) return decodeEntities(song.subtitle);
+  if (more.music) return more.music;
+  if (item.subtitle) return item.subtitle;
+  if (item.primary_artists) return item.primary_artists;
   return "Unknown Artist";
 }
 
-function mapTrack(song) {
-  const dl = bestDownloadUrl(song.downloadUrl);
+async function jioFetch(callName, params, timeoutMs = FETCH_TIMEOUT_MS) {
+  const queryObj = Object.assign(
+    {
+      __call: callName,
+      _format: "json",
+      _marker: "0",
+      api_version: "4",
+      ctx: "web6dot0",
+      language: "english,hindi,punjabi,tamil,telugu,marathi,gujarati,bengali,kannada,malayalam,bhojpuri,rajasthani,urdu,haryanvi",
+    },
+    params || {}
+  );
+  const searchParams = new URLSearchParams();
+  Object.keys(queryObj).forEach((k) => searchParams.append(k, queryObj[k]));
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(`${API_BASE}?${searchParams.toString()}`, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Cookie": INDIA_LANGUAGE_COOKIE,
+        "X-Forwarded-For": INDIA_IP,
+        "Client-IP": INDIA_IP,
+      },
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new Error(`JioSaavn ${callName} -> HTTP ${response.status}`);
+    return await response.json();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Mapping — raw JioSaavn item -> Eclipse track/album/artist/playlist  */
+/* ------------------------------------------------------------------ */
+
+function mapTrack(item) {
+  if (!item) return null;
+  const more = item.more_info || {};
+  const id = String(item.id || item.song_id || "");
+  if (!id) return null;
   return {
-    id: song.id,
-    title: decodeEntities(song.name || song.title),
-    artist: artistNames(song),
-    album: song.album ? decodeEntities(song.album.name) : undefined,
-    duration: song.duration ? parseInt(song.duration, 10) : undefined,
-    artworkURL: bestImage(song.image),
-    format: "m4a",
-    streamURL: dl ? dl.url : undefined,
+    id,
+    title: sanitizeText(item.title || item.song || "Untitled"),
+    artist: sanitizeText(formatArtist(item)),
+    album: sanitizeText(more.album || item.album || ""),
+    duration: parseInt(more.duration || item.duration || 0, 10),
+    artworkURL: upgradeArtwork(item.image),
+    format: (more["320kbps"] === "true" || more["320kbps"] === true) ? "mp4" : "mp4",
   };
 }
 
-function mapAlbum(album) {
+function mapAlbum(item) {
   return {
-    id: album.id,
-    title: decodeEntities(album.name),
-    artist: artistNames(album),
-    artworkURL: bestImage(album.image),
-    trackCount: album.songCount ? parseInt(album.songCount, 10) : (album.songs ? album.songs.length : undefined),
-    year: album.year,
+    id: String(item.id || ""),
+    title: sanitizeText(item.title || item.name || "Untitled Album"),
+    artist: sanitizeText(formatArtist(item)),
+    artworkURL: upgradeArtwork(item.image),
+    trackCount: item.more_info && item.more_info.song_count ? parseInt(item.more_info.song_count, 10) : undefined,
+    year: item.year,
   };
 }
 
-function mapArtist(artist) {
+function mapArtist(item) {
   return {
-    id: artist.id,
-    name: decodeEntities(artist.name),
-    artworkURL: bestImage(artist.image),
+    id: String(item.id || item.artistid || ""),
+    name: sanitizeText(item.title || item.name || "Unknown Artist"),
+    artworkURL: upgradeArtwork(item.image),
     genres: [],
   };
 }
 
-function mapPlaylist(playlist) {
+function mapPlaylist(item) {
   return {
-    id: playlist.id,
-    title: decodeEntities(playlist.name),
-    creator: playlist.subtitle ? decodeEntities(playlist.subtitle) : "JioSaavn",
-    artworkURL: bestImage(playlist.image),
-    trackCount: playlist.songCount ? parseInt(playlist.songCount, 10) : undefined,
+    id: String(item.id || item.listid || ""),
+    title: sanitizeText(item.title || item.listname || "Untitled Playlist"),
+    creator: sanitizeText(item.firstname || item.subtitle || "JioSaavn"),
+    artworkURL: upgradeArtwork(item.image),
+    trackCount: item.more_info && item.more_info.song_count ? parseInt(item.more_info.song_count, 10) : undefined,
   };
 }
 
-/* ------------------------------------------------------------------ */
-/* Backend fetch — hard timeout + spoofed India region headers         */
-/* ------------------------------------------------------------------ */
-
-async function saavnGet(path, timeoutMs = FETCH_TIMEOUT_MS) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const res = await fetch(`${SAAVN_BASE}${path}`, {
-      headers: regionHeaders(),
-      signal: controller.signal,
-    });
-    if (!res.ok) {
-      const text = await res.text().catch(() => "");
-      throw new Error(`jiosaavn-api ${path} -> HTTP ${res.status} ${text.slice(0, 200)}`);
-    }
-    const body = await res.json();
-    if (!body.success) {
-      throw new Error(`jiosaavn-api ${path} returned success:false`);
-    }
-    return body.data;
-  } finally {
-    clearTimeout(timer);
-  }
+function formatAudioUrl(decryptedUrl, preferredQuality) {
+  if (!decryptedUrl) return "";
+  const bitrate = preferredQuality || "320";
+  return decryptedUrl.replace(/_(12|48|96|128|160|320)\.(mp4|mp3)$/i, `_${bitrate}.$2`);
 }
 
 /* ------------------------------------------------------------------ */
@@ -179,25 +336,17 @@ function getRedis(env) {
 
 async function rGet(redis, key) {
   if (redis) {
-    try {
-      return await redis.get(key);
-    } catch {}
+    try { return await redis.get(key); } catch {}
   }
   const e = memCache.get(key);
   if (!e) return null;
-  if (e.exp < Date.now()) {
-    memCache.delete(key);
-    return null;
-  }
+  if (e.exp < Date.now()) { memCache.delete(key); return null; }
   return e.val;
 }
 
 async function rSet(redis, key, value, ttl) {
   if (redis) {
-    try {
-      await redis.set(key, value, { ex: ttl });
-      return;
-    } catch {}
+    try { await redis.set(key, value, { ex: ttl }); return; } catch {}
   }
   memCache.set(key, { val: value, exp: Date.now() + ttl * 1000 });
   if (memCache.size > 500) memCache.delete(memCache.keys().next().value);
@@ -207,14 +356,10 @@ async function withRedisCache(env, ctx, key, ttl, fn) {
   const redis = getRedis(env);
   const cached = await rGet(redis, key);
   if (cached) return json(cached);
-
   const data = await fn();
   const writeBack = rSet(redis, key, data, ttl);
-  if (ctx && typeof ctx.waitUntil === "function") {
-    ctx.waitUntil(writeBack);
-  } else {
-    await writeBack;
-  }
+  if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(writeBack);
+  else await writeBack;
   return json(data);
 }
 
@@ -222,8 +367,8 @@ function manifest(token) {
   return {
     id: token ? `com.eclipse-addons.jiosaavn.${token}` : "com.eclipse-addons.jiosaavn",
     name: "JioSaavn",
-    version: "1.6.0",
-    description: "Stream Bollywood, Indian regional, and international tracks from JioSaavn.",
+    version: "2.0.0",
+    description: "Stream Bollywood, Indian regional, and international tracks from JioSaavn — direct API, India-region headers.",
     icon: "https://www.jiosaavn.com/favicon.ico",
     resources: ["search", "stream", "catalog"],
     types: ["track", "album", "artist", "playlist"],
@@ -232,40 +377,43 @@ function manifest(token) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Search — always fresh, no cache of any kind                        */
+/* Search — always fresh, four parallel raw-API calls                  */
 /* ------------------------------------------------------------------ */
 
 async function handleSearch(query) {
   if (!query) return { tracks: [], albums: [], artists: [], playlists: [] };
 
   const [songsRes, albumsRes, artistsRes, playlistsRes] = await Promise.allSettled([
-    saavnGet(`/search/songs?query=${encodeURIComponent(query)}&limit=15`),
-    saavnGet(`/search/albums?query=${encodeURIComponent(query)}&limit=6`),
-    saavnGet(`/search/artists?query=${encodeURIComponent(query)}&limit=6`),
-    saavnGet(`/search/playlists?query=${encodeURIComponent(query)}&limit=6`),
+    jioFetch("search.getSongResults", { q: query, p: "1", n: "15" }),
+    jioFetch("search.getAlbumResults", { q: query, p: "1", n: "6" }),
+    jioFetch("search.getArtistResults", { q: query, p: "1", n: "6" }),
+    jioFetch("search.getPlaylistResults", { q: query, p: "1", n: "6" }),
   ]);
 
-  const tracks = songsRes.status === "fulfilled" ? (songsRes.value.results || []).map(mapTrack) : [];
-  const albums = albumsRes.status === "fulfilled" ? (albumsRes.value.results || []).map(mapAlbum) : [];
-  const artists = artistsRes.status === "fulfilled" ? (artistsRes.value.results || []).map(mapArtist) : [];
-  const playlists = playlistsRes.status === "fulfilled" ? (playlistsRes.value.results || []).map(mapPlaylist) : [];
+  const tracks = songsRes.status === "fulfilled" ? ((songsRes.value.results || []).map(mapTrack).filter(Boolean)) : [];
+  const albums = albumsRes.status === "fulfilled" ? ((albumsRes.value.results || []).map(mapAlbum)) : [];
+  const artists = artistsRes.status === "fulfilled" ? ((artistsRes.value.results || []).map(mapArtist)) : [];
+  const playlists = playlistsRes.status === "fulfilled" ? ((playlistsRes.value.results || []).map(mapPlaylist)) : [];
 
   return { tracks, albums, artists, playlists };
 }
 
 /* ------------------------------------------------------------------ */
-/* Stream — always fresh, one fast retry on failure/timeout            */
+/* Stream — song.getDetails + DES decrypt, always fresh, one retry     */
 /* ------------------------------------------------------------------ */
 
 async function resolveStream(id, timeoutMs) {
-  const song = await saavnGet(`/songs/${encodeURIComponent(id)}`, timeoutMs);
-  const record = Array.isArray(song) ? song[0] : song;
-  const dl = bestDownloadUrl(record.downloadUrl);
-  if (!dl || !dl.url) throw new Error("No stream URL available for this track");
+  const data = await jioFetch("song.getDetails", { pids: id }, timeoutMs);
+  const songObj = data[id] || (data.songs && data.songs[0]);
+  if (!songObj) throw new Error("Track not found");
+  const encUrl = (songObj.more_info && songObj.more_info.encrypted_media_url) || songObj.encrypted_media_url;
+  if (!encUrl) throw new Error("No encrypted media URL found for this track");
+  const decrypted = DES.decrypt(encUrl, DES_KEY);
+  const finalUrl = formatAudioUrl(decrypted, "320");
   return {
-    url: dl.url,
-    format: "m4a",
-    quality: dl.quality || "320kbps",
+    url: finalUrl,
+    format: finalUrl.indexOf(".mp3") !== -1 ? "mp3" : "mp4",
+    quality: finalUrl.indexOf("_320") !== -1 ? "320kbps" : "160kbps",
   };
 }
 
@@ -286,49 +434,37 @@ async function handleStream(id) {
 /* ------------------------------------------------------------------ */
 
 async function handleAlbum(id) {
-  const album = await saavnGet(`/albums?id=${encodeURIComponent(id)}`);
+  const data = await jioFetch("content.getAlbumDetails", { albumid: id });
+  const tracks = (data.list || data.songs || []).map(mapTrack).filter(Boolean);
   return {
-    id: album.id,
-    title: decodeEntities(album.name),
-    artist: artistNames(album),
-    artworkURL: bestImage(album.image),
-    year: album.year,
-    trackCount: album.songs ? album.songs.length : undefined,
-    tracks: (album.songs || []).map(mapTrack),
+    id: String(data.id || id),
+    title: sanitizeText(data.title || data.name || "Untitled Album"),
+    artist: sanitizeText(formatArtist(data)),
+    artworkURL: upgradeArtwork(data.image),
+    year: data.year,
+    trackCount: tracks.length,
+    tracks,
   };
 }
 
 /* ------------------------------------------------------------------ */
-/* Artist (cached) — parallel fallback calls                           */
+/* Artist (cached)                                                      */
 /* ------------------------------------------------------------------ */
 
 async function handleArtist(id) {
-  const artist = await saavnGet(`/artists/${encodeURIComponent(id)}`);
+  const data = await jioFetch("artist.getArtistPageDetails", { artistId: id });
 
-  let topTracks = (artist.topSongs || []).map(mapTrack);
-  let albums = (artist.topAlbums || []).map(mapAlbum);
+  const rawSongs = (data.topSongs && (data.topSongs.songs || data.topSongs)) || data.top_songs || [];
+  const rawAlbums = (data.topAlbums && (data.topAlbums.albums || data.topAlbums)) || data.top_albums || [];
 
-  const needsSongs = topTracks.length === 0;
-  const needsAlbums = albums.length === 0;
-
-  if (needsSongs || needsAlbums) {
-    const [songsFallback, albumsFallback] = await Promise.allSettled([
-      needsSongs ? saavnGet(`/artists/${encodeURIComponent(id)}/songs`) : Promise.resolve(null),
-      needsAlbums ? saavnGet(`/artists/${encodeURIComponent(id)}/albums`) : Promise.resolve(null),
-    ]);
-    if (needsSongs && songsFallback.status === "fulfilled" && songsFallback.value) {
-      topTracks = (songsFallback.value.songs || songsFallback.value.results || []).map(mapTrack);
-    }
-    if (needsAlbums && albumsFallback.status === "fulfilled" && albumsFallback.value) {
-      albums = (albumsFallback.value.albums || albumsFallback.value.results || []).map(mapAlbum);
-    }
-  }
+  const topTracks = Array.isArray(rawSongs) ? rawSongs.map(mapTrack).filter(Boolean) : [];
+  const albums = Array.isArray(rawAlbums) ? rawAlbums.map(mapAlbum) : [];
 
   return {
-    id: artist.id,
-    name: decodeEntities(artist.name),
-    artworkURL: bestImage(artist.image),
-    bio: artist.bio ? decodeEntities(Array.isArray(artist.bio) ? artist.bio[0]?.text : artist.bio) : undefined,
+    id: String(data.artistId || data.id || id),
+    name: sanitizeText(data.name || data.title || "Unknown Artist"),
+    artworkURL: upgradeArtwork(data.image),
+    bio: data.bio ? sanitizeText(Array.isArray(data.bio) ? data.bio[0]?.text : data.bio) : undefined,
     genres: [],
     topTracks,
     albums,
@@ -340,14 +476,15 @@ async function handleArtist(id) {
 /* ------------------------------------------------------------------ */
 
 async function handlePlaylist(id) {
-  const playlist = await saavnGet(`/playlists?id=${encodeURIComponent(id)}`);
+  const data = await jioFetch("playlist.getDetails", { listid: id });
+  const tracks = (data.list || data.songs || []).map(mapTrack).filter(Boolean);
   return {
-    id: playlist.id,
-    title: decodeEntities(playlist.name),
-    description: playlist.description ? decodeEntities(playlist.description) : undefined,
-    artworkURL: bestImage(playlist.image),
-    creator: playlist.subtitle ? decodeEntities(playlist.subtitle) : "JioSaavn",
-    tracks: (playlist.songs || []).map(mapTrack),
+    id: String(data.id || id),
+    title: sanitizeText(data.title || data.listname || "Untitled Playlist"),
+    description: data.subtitle ? sanitizeText(data.subtitle) : undefined,
+    artworkURL: upgradeArtwork(data.image),
+    creator: sanitizeText(data.firstname || data.username || "JioSaavn"),
+    tracks,
   };
 }
 
@@ -360,9 +497,7 @@ function generateToken() {
   let t = "";
   const arr = new Uint8Array(28);
   crypto.getRandomValues(arr);
-  for (let i = 0; i < arr.length; i++) {
-    t += chars[arr[i] % chars.length];
-  }
+  for (let i = 0; i < arr.length; i++) t += chars[arr[i] % chars.length];
   return t;
 }
 
@@ -373,9 +508,7 @@ function generateToken() {
 function parsePath(pathname) {
   const parts = pathname.split("/").filter(Boolean);
   if (parts.length === 0) return { token: null, rest: "/" };
-  if (KNOWN_ROUTES.has(parts[0])) {
-    return { token: null, rest: "/" + parts.join("/") };
-  }
+  if (KNOWN_ROUTES.has(parts[0])) return { token: null, rest: "/" + parts.join("/") };
   return { token: parts[0], rest: "/" + parts.slice(1).join("/") };
 }
 
@@ -413,7 +546,7 @@ function landingPage() {
   <div class="card">
     <h1>JioSaavn Addon for Eclipse</h1>
     <p class="sub">Generate a unique addon URL and install it in Eclipse under Settings → Cloud Storage → Add Connection → Addons.</p>
-    <div class="tip"><b>Note:</b> JioSaavn requires no login or API key. Each generated URL carries a fresh, unique token in its path — it's a per-install identifier, not a credential.</div>
+    <div class="tip"><b>Note:</b> Direct JioSaavn API, India-region headers applied. Each generated URL carries a fresh, unique token in its path.</div>
     <button id="genBtn" onclick="generate()">Generate Addon URL</button>
     <div id="genBox">
       <div class="label">Your manifest URL</div>
@@ -426,7 +559,6 @@ function landingPage() {
 <script>
   let genUrlVal = '';
   let genCount = 0;
-
   function generate() {
     const btn = document.getElementById('genBtn');
     btn.disabled = true;
@@ -449,7 +581,6 @@ function landingPage() {
         btn.textContent = 'Generate Addon URL';
       });
   }
-
   function copyUrl() {
     if (!genUrlVal) return;
     navigator.clipboard.writeText(genUrlVal).then(function () {
@@ -466,39 +597,32 @@ function landingPage() {
 
 export default {
   async fetch(request, env, ctx) {
-    if (request.method === "OPTIONS") {
-      return new Response(null, { headers: CORS_HEADERS });
-    }
+    if (request.method === "OPTIONS") return new Response(null, { headers: CORS_HEADERS });
 
     const url = new URL(request.url);
     const { token, rest } = parsePath(url.pathname);
 
     try {
       if (rest === "/" || rest === "") {
-        return new Response(landingPage(), {
-          headers: { "Content-Type": "text/html; charset=utf-8", ...CORS_HEADERS },
-        });
+        return new Response(landingPage(), { headers: { "Content-Type": "text/html; charset=utf-8", ...CORS_HEADERS } });
       }
 
       if (rest === "/generate" && request.method === "POST") {
         const newToken = generateToken();
-        const manifestUrl = `${url.origin}/${newToken}/manifest.json`;
-        return json({ token: newToken, manifestUrl });
+        return json({ token: newToken, manifestUrl: `${url.origin}/${newToken}/manifest.json` });
       }
 
       if (rest === "/debug") {
         const q = url.searchParams.get("q") || "drake";
         try {
-          const raw = await saavnGet(`/search/songs?query=${encodeURIComponent(q)}&limit=3`);
-          return json({ ok: true, base: SAAVN_BASE, sample: raw });
+          const raw = await jioFetch("search.getSongResults", { q, p: "1", n: "3" });
+          return json({ ok: true, sample: raw });
         } catch (err) {
-          return json({ ok: false, base: SAAVN_BASE, error: err.message }, 502);
+          return json({ ok: false, error: err.message }, 502);
         }
       }
 
-      if (rest === "/manifest.json") {
-        return json(manifest(token));
-      }
+      if (rest === "/manifest.json") return json(manifest(token));
 
       if (rest === "/search" || rest.startsWith("/search?")) {
         const q = url.searchParams.get("q") || "";
@@ -506,9 +630,7 @@ export default {
       }
 
       const streamMatch = rest.match(/^\/stream\/(.+)$/);
-      if (streamMatch) {
-        return json(await handleStream(streamMatch[1]));
-      }
+      if (streamMatch) return json(await handleStream(streamMatch[1]));
 
       const albumMatch = rest.match(/^\/album\/(.+)$/);
       if (albumMatch) {
